@@ -67,9 +67,9 @@ def calculate_macd(df, short=12, long=26, signal=9):
 
 # Function to calculate Moving Averages
 def calculate_moving_averages(df):
+    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()  # 20-period EMA
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()  # 50-period EMA
     df["EMA100"] = df["close"].ewm(span=100, adjust=False).mean()  # 100-period EMA
-    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()  # 20-period EMA
     return df
 
 # Initialize Dash App
@@ -89,17 +89,11 @@ app.layout = html.Div([
 def update_graph(n_intervals):
     
     # Fetch the latest 4-hour BTC data
-    days = 150/6 # total_candlesticks/n_candle_stick_per_day
+    days = 400/6 # total_candlesticks/n_candle_stick_per_day
     start_time = datetime.date.today() - datetime.timedelta(days=days)
     data = get_btc_data(interval="4h",
                         limit=150,
                         start_time=get_start_time(year=start_time.year, month=start_time.month, day=start_time.day))
-    
-    # Fetch last 200 days data to calculate emas
-    start_time = datetime.date.today() - datetime.timedelta(days=200)
-    ema_data = get_btc_data(interval="1d",
-                            limit=200,
-                            start_time=get_start_time(year=start_time.year, month=start_time.month, day=start_time.day))
     
     # Compute Fibonacci levels
     fib_levels = calculate_fibonacci_levels(data)
@@ -107,7 +101,7 @@ def update_graph(n_intervals):
     # Compute RSI, MACD, and Moving Averages
     data = calculate_rsi(data)
     data = calculate_macd(data)
-    ema_data = calculate_moving_averages(ema_data).tail(25)
+    ema_data = calculate_moving_averages(data)
 
     # Create a live chart with 3 subplots: Price, RSI, MACD
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
