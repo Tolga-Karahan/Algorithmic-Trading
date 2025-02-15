@@ -103,6 +103,7 @@ def update_graph(n_intervals):
     data = calculate_macd(data)
     ema_data = calculate_moving_averages(data)
 
+
     # Create a live chart with 3 subplots: Price, RSI, MACD
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                         subplot_titles=("BTC/USDT Price with Moving Averages & Fibonacci Levels",
