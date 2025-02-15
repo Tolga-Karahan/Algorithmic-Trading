@@ -19,11 +19,7 @@ def get_start_time(year, month, day, hour=0, minute=0, second=0):
     return timestamp_ms
 
 def get_latest_btc_data(interval=INTERVAL, limit=N_DATA_POINTS, start_time=get_start_time(2025, 1, 1)):
-    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
-    
-    if start_time:
-        url += f"&startTime={start_time}"
-        
+    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}&startTime={start_time}"
     response = requests.get(url).json()
     
     new_data = pd.DataFrame(response, columns=["timestamp", "open", "high", "low", "close", "volume", 
