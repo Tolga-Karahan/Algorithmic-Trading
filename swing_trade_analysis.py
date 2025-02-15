@@ -72,7 +72,7 @@ def calculate_moving_averages(df):
     df["EMA100"] = df["close"].ewm(span=100, adjust=False).mean()  # 100-period EMA
     return df
 
-
+  
 def calculate_vwap(df, period_candles=None, name="VWAP"):
     """
     Calculate VWAP (Volume Weighted Average Price) for different periods.
