@@ -72,6 +72,30 @@ def calculate_moving_averages(df):
     df["EMA100"] = df["close"].ewm(span=100, adjust=False).mean()  # 100-period EMA
     return df
 
+
+def calculate_vwap(df, period_candles=None):
+    """
+    Calculate VWAP (Volume Weighted Average Price) for different periods.
+    :param df: DataFrame with 'high', 'low', 'close', and 'volume'.
+    :param period_candles: Number of candles to use for VWAP (e.g., 10, 50, 200).
+                           If None, calculates cumulative VWAP for all data.
+    :return: DataFrame with VWAP column.
+    """
+    df["Typical Price"] = (df["high"] + df["low"] + df["close"]) / 3
+
+    if period_candles:
+        df["VWAP"] = (
+            df["Typical Price"].rolling(window=period_candles).apply(lambda x: (x * df["volume"]).sum()) /
+            df["volume"].rolling(window=period_candles).sum()
+        )
+    else:
+        df["Cumulative TP x Volume"] = (df["Typical Price"] * df["volume"]).cumsum()
+        df["Cumulative Volume"] = df["volume"].cumsum()
+        df["VWAP"] = df["Cumulative TP x Volume"] / df["Cumulative Volume"]
+
+    return df
+
+
 # Initialize Dash App
 app = dash.Dash(__name__)
 
@@ -103,6 +127,7 @@ def update_graph(n_intervals):
     data = calculate_rsi(data)
     data = calculate_macd(data)
     ema_data = calculate_moving_averages(data)
+    btc_data_vwap_full = calculate_vwap(data)  # Full VWAP (Cumulative)
 
     # Create a live chart with 3 subplots: Price, RSI, MACD
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
@@ -127,6 +152,10 @@ def update_graph(n_intervals):
 
     fig.add_trace(go.Scatter(x=ema_data["timestamp"], y=ema_data["EMA20"], mode="lines",
                              name="20-EMA", line=dict(color="green")), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=btc_data_vwap_full["timestamp"], y=btc_data_vwap_full["VWAP"], mode="lines",
+                         name="VWAP", line=dict(color="black", dash="dot")), row=1, col=1)
+
 
     # --- RSI Chart ---
     fig.add_trace(go.Scatter(x=data["timestamp"], y=data["RSI"], mode="lines",
