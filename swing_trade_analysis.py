@@ -89,10 +89,11 @@ app.layout = html.Div([
 def update_graph(n_intervals):
     
     # Fetch the latest 4-hour BTC data
-    days = 400/6 # total_candlesticks/n_candle_stick_per_day
+    limit = 400
+    days = limit/6 # total_candlesticks/n_candle_stick_per_day
     start_time = datetime.date.today() - datetime.timedelta(days=days)
     data = get_btc_data(interval="4h",
-                        limit=150,
+                        limit=limit,
                         start_time=get_start_time(year=start_time.year, month=start_time.month, day=start_time.day))
     
     # Compute Fibonacci levels
@@ -102,7 +103,6 @@ def update_graph(n_intervals):
     data = calculate_rsi(data)
     data = calculate_macd(data)
     ema_data = calculate_moving_averages(data)
-
 
     # Create a live chart with 3 subplots: Price, RSI, MACD
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
