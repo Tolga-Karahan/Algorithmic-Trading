@@ -8,17 +8,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dash.dependencies import Input, Output
 
-# Global storage for real-time data
-N_DATA_POINTS = 600
-INTERVAL = "4h"
-
 # Convert human-readable date to milliseconds (UTC)
 def get_start_time(year, month, day, hour=0, minute=0, second=0):
     dt = datetime.datetime(year, month, day, hour, minute, second)  # Create datetime object
     timestamp_ms = int(dt.timestamp() * 1000)  # Convert to milliseconds
     return timestamp_ms
 
-def get_latest_btc_data(interval=INTERVAL, limit=N_DATA_POINTS, start_time=get_start_time(2025, 1, 1)):
+def get_btc_data(interval, limit, start_time=get_start_time(2024, 1, 1)):
     url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}&startTime={start_time}"
     response = requests.get(url).json()
     
@@ -71,8 +67,8 @@ def calculate_macd(df, short=12, long=26, signal=9):
 
 # Function to calculate Moving Averages
 def calculate_moving_averages(df):
-    df["SMA50"] = df["close"].rolling(window=50).mean()  # 50-period SMA
-    df["SMA100"] = df["close"].rolling(window=100).mean()  # 100-period SMA
+    df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()  # 50-period EMA
+    df["EMA100"] = df["close"].ewm(span=100, adjust=False).mean()  # 100-period EMA
     df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()  # 20-period EMA
     return df
 
@@ -93,10 +89,17 @@ app.layout = html.Div([
 def update_graph(n_intervals):
     
     # Fetch the latest 4-hour BTC data
-    data = get_latest_btc_data()
+    days = 150/6 # total_candlesticks/n_candle_stick_per_day
+    start_time = datetime.date.today() - datetime.timedelta(days=days)
+    data = get_btc_data(interval="4h",
+                        limit=150,
+                        start_time=get_start_time(year=start_time.year, month=start_time.month, day=start_time.day))
     
-    # Keep only last N_DATA_POINTS candles for visualization
-    data = data.tail(N_DATA_POINTS)
+    # Fetch last 200 days data to calculate emas
+    start_time = datetime.date.today() - datetime.timedelta(days=200)
+    ema_data = get_btc_data(interval="1d",
+                            limit=200,
+                            start_time=get_start_time(year=start_time.year, month=start_time.month, day=start_time.day))
     
     # Compute Fibonacci levels
     fib_levels = calculate_fibonacci_levels(data)
@@ -104,7 +107,7 @@ def update_graph(n_intervals):
     # Compute RSI, MACD, and Moving Averages
     data = calculate_rsi(data)
     data = calculate_macd(data)
-    data = calculate_moving_averages(data)
+    ema_data = calculate_moving_averages(ema_data).tail(25)
 
     # Create a live chart with 3 subplots: Price, RSI, MACD
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
@@ -121,13 +124,13 @@ def update_graph(n_intervals):
                                  y=[price, price], mode="lines", name=f"Fib {level}", line=dict(dash="dash")), row=1, col=1)
 
     # Add Moving Averages
-    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["SMA50"], mode="lines",
-                             name="50-SMA", line=dict(color="orange")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ema_data["timestamp"], y=ema_data["EMA50"], mode="lines",
+                             name="50-EMA", line=dict(color="orange")), row=1, col=1)
     
-    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["SMA100"], mode="lines",
-                             name="100-SMA", line=dict(color="red")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ema_data["timestamp"], y=ema_data["EMA100"], mode="lines",
+                             name="100-EMA", line=dict(color="red")), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["EMA20"], mode="lines",
+    fig.add_trace(go.Scatter(x=ema_data["timestamp"], y=ema_data["EMA20"], mode="lines",
                              name="20-EMA", line=dict(color="green")), row=1, col=1)
 
     # --- RSI Chart ---
