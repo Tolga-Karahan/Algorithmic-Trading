@@ -9,6 +9,11 @@ import pandas as pd
 # ✅ Initialize Binance API
 api_key = os.getenv("BINANCE_API_KEY")
 api_secret = os.getenv("BINANCE_SECRET_KEY")
+exchange = ccxt.binance({
+        'apiKey': api_key,
+        'secret': api_secret,
+        'options': {'defaultType': 'future'},  # Use futures if trading leverage
+})
 
 
 def get_btc_data(interval, limit, start_time=None):
@@ -50,12 +55,6 @@ def calculate_vwap(df, period_candles=None, name="VWAP"):
     return df
 
 def create_order():
-    exchange = ccxt.binance({
-        'apiKey': api_key,
-        'secret': api_secret,
-        'options': {'defaultType': 'future'},  # Use futures if trading leverage
-    })
-
     # ✅ Trading Parameters
     symbol = "BTC/USDT"
     risk_percentage = 0.5  # 0.5% risk per trade
@@ -124,39 +123,42 @@ def create_order():
         print(f"❌ Error: {e}")
 
 
+# ✅ Function to Check if Open Orders Exist
+def has_open_order(symbol="BTC/USDT"):
+    open_orders = exchange.fetch_open_orders(symbol)
+    return len(open_orders) > 0
+
+
 # ✅ Function to Continuously Fetch Data & Execute Orders
 def run_trading_bot():
-    last_trade_direction = None  # Track the last trade direction to avoid duplicate orders
-
     while True:
         try:
-            print("🔄 Fetching latest BTC/USDT data...")
+            if has_open_order():
+                print("Open Order Exists. Skipping Trade.")
+            else:
+                print("🔄 Fetching latest BTC/USDT data...")
 
-            # ✅ Fetch the latest 4-hour interval BTC data
-            limit = 6  # Fetch last 6 candles (24 hours)
-            data = get_btc_data(interval="4h", limit=limit)
+                # ✅ Fetch the latest 4-hour interval BTC data
+                limit = 6  # Fetch last 6 candles (24 hours)
+                data = get_btc_data(interval="4h", limit=limit)
 
-            # ✅ Calculate VWAPs dynamically
-            data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP")
-            data = calculate_vwap(data, period_candles=6, name="Daily VWAP")
+                # ✅ Calculate VWAPs dynamically
+                data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP")
+                data = calculate_vwap(data, period_candles=6, name="Daily VWAP")
 
-            # ✅ Check for VWAP Crossover (Bullish & Bearish)
-            prev_4h_vwap = data["4-Hourly VWAP"].iloc[-2]
-            curr_4h_vwap = data["4-Hourly VWAP"].iloc[-1]
-            prev_daily_vwap = data["Daily VWAP"].iloc[-2]
-            curr_daily_vwap = data["Daily VWAP"].iloc[-1]
+                # ✅ Check for VWAP Crossover (Bullish & Bearish)
+                prev_4h_vwap = data["4-Hourly VWAP"].iloc[-2]
+                curr_4h_vwap = data["4-Hourly VWAP"].iloc[-1]
+                prev_daily_vwap = data["Daily VWAP"].iloc[-2]
+                curr_daily_vwap = data["Daily VWAP"].iloc[-1]
 
-            # 🟢 Bullish Crossover (4H VWAP crosses above Daily VWAP)
-            if prev_4h_vwap < prev_daily_vwap and curr_4h_vwap > curr_daily_vwap:
-                if last_trade_direction != "long":
-                    print("✅ Bullish VWAP Crossover Detected! Placing Buy Order...")
-                    create_order()
-                    last_trade_direction = "long"
-                else:
-                    print("Already in a long trade. Skipping duplicate order.")
+                # 🟢 Bullish Crossover (4H VWAP crosses above Daily VWAP)
+                if prev_4h_vwap < prev_daily_vwap and curr_4h_vwap > curr_daily_vwap:
+                        print("✅ Bullish VWAP Crossover Detected! Placing Buy Order...")
+                        create_order()
 
-            # ✅ Wait before fetching new data (e.g., every 10 seconds)
-            time.sleep(10)
+                # ✅ Wait before fetching new data (e.g., every 10 seconds)
+                time.sleep(10)
 
         except Exception as e:
             print(f"❌ Error: {e}")
