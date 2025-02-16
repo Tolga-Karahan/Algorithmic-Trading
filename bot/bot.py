@@ -129,8 +129,12 @@ if __name__ == "__main__":
     # Fetch the latest 4-hour interval daily BTC data
     limit = 6
     data = get_btc_data(interval="4h", limit=limit)
+    
     data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP") # Daily VWAP
     data = calculate_vwap(data, period_candles=6, name="Daily VWAP") # Weekly VWAP
+    
+    if data["4-Hourly VWAP"].iloc[-1] > data["Daily VWAP"].iloc[-1]:
+        create_order()
     
     
 
