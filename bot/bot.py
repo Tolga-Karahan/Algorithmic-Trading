@@ -156,7 +156,7 @@ class TradingBot:
                     # 🟢 Bullish Crossover (4H VWAP crosses above Daily VWAP)
                     if prev_4h_vwap < prev_daily_vwap and curr_4h_vwap > curr_daily_vwap:
                             print("✅ Bullish VWAP Crossover Detected! Placing Buy Order...")
-                            create_order()
+                            self.create_order()
 
                     # ✅ Wait before fetching new data (e.g., every 10 seconds)
                     time.sleep(10)
