@@ -126,6 +126,8 @@ def create_order():
 
 # ✅ Function to Continuously Fetch Data & Execute Orders
 def run_trading_bot():
+    last_trade_direction = None  # Track the last trade direction to avoid duplicate orders
+
     while True:
         try:
             print("🔄 Fetching latest BTC/USDT data...")
@@ -138,12 +140,20 @@ def run_trading_bot():
             data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP")
             data = calculate_vwap(data, period_candles=6, name="Daily VWAP")
 
-            # ✅ Check Trading Condition
-            if data["4-Hourly VWAP"].iloc[-1] > data["Daily VWAP"].iloc[-1]:
-                print("✅ Condition Met: 4H VWAP > Daily VWAP")
-                create_order()  # 🚀 Execute trade
-            else:
-                print("❌ Condition Not Met: No trade executed.")
+            # ✅ Check for VWAP Crossover (Bullish & Bearish)
+            prev_4h_vwap = data["4-Hourly VWAP"].iloc[-2]
+            curr_4h_vwap = data["4-Hourly VWAP"].iloc[-1]
+            prev_daily_vwap = data["Daily VWAP"].iloc[-2]
+            curr_daily_vwap = data["Daily VWAP"].iloc[-1]
+
+            # 🟢 Bullish Crossover (4H VWAP crosses above Daily VWAP)
+            if prev_4h_vwap < prev_daily_vwap and curr_4h_vwap > curr_daily_vwap:
+                if last_trade_direction != "long":
+                    print("✅ Bullish VWAP Crossover Detected! Placing Buy Order...")
+                    create_order()
+                    last_trade_direction = "long"
+                else:
+                    print("Already in a long trade. Skipping duplicate order.")
 
             # ✅ Wait before fetching new data (e.g., every 10 seconds)
             time.sleep(10)
