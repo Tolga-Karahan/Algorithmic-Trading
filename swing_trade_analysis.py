@@ -70,7 +70,8 @@ def calculate_macd(df, short=12, long=26, signal=9):
 
 # Function to calculate Moving Averages
 def calculate_moving_averages(df):
-    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()  # 20-period EMA
+    df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()  # 20-period EMA
+    df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()  # 20-period EMA
     df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()  # 50-period EMA
     df["EMA100"] = df["close"].ewm(span=100, adjust=False).mean()  # 100-period EMA
     return df
@@ -129,11 +130,11 @@ def update_graph(n_intervals):
     data = calculate_rsi(data)
     data = calculate_macd(data)
     data = calculate_moving_averages(data)
-    data = calculate_vwap(data, period_candles=4*6, name="Daily VWAP") # Daily VWAP
-    data = calculate_vwap(data, period_candles=4*6*7, name="Weekly VWAP") # Weekly VWAP
+    data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP") # Daily VWAP
+    data = calculate_vwap(data, period_candles=4*6, name="Daily VWAP") # Weekly VWAP
 
     # Create a live chart with 3 subplots: Price, RSI, MACD
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, shared_yaxes=True,vertical_spacing=0.1,
                         subplot_titles=("BTC/USDT Price with Moving Averages & Fibonacci Levels",
                                         "RSI (Relative Strength Index)", 
                                         "MACD Indicator"))
@@ -159,14 +160,17 @@ def update_graph(n_intervals):
     fig.add_trace(go.Scatter(x=data["timestamp"], y=data["EMA100"], mode="lines",
                              name="100-EMA", line=dict(color="red")), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["EMA20"], mode="lines",
-                             name="20-EMA", line=dict(color="green")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["EMA21"], mode="lines",
+                             name="21-EMA", line=dict(color="green")), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["EMA9"], mode="lines",
+                             name="9-EMA", line=dict(color="brown")), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["4-Hourly VWAP"], mode="lines",
+                         name="4-Hourly VWAP", line=dict(color="black", dash="dot")), row=1, col=1)
     
     fig.add_trace(go.Scatter(x=data["timestamp"], y=data["Daily VWAP"], mode="lines",
-                         name="Daily VWAP", line=dict(color="black", dash="dot")), row=1, col=1)
-    
-    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["Weekly VWAP"], mode="lines",
-                         name="Weekly VWAP", line=dict(color="purple", dash="dot")), row=1, col=1)
+                         name="Daily VWAP", line=dict(color="purple", dash="dot")), row=1, col=1)
 
 
     # --- RSI Chart ---
@@ -186,7 +190,7 @@ def update_graph(n_intervals):
     # Update layout
     fig.update_layout(title="Real-Time BTC/USDT Price Chart with Moving Averages, Fibonacci, RSI & MACD",
                       xaxis_title="Time",
-                      height=4000,
+                      height=8000,
                       showlegend=True)
 
     return fig
