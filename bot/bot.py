@@ -124,19 +124,36 @@ def create_order():
         print(f"❌ Error: {e}")
 
 
+# ✅ Function to Continuously Fetch Data & Execute Orders
+def run_trading_bot():
+    while True:
+        try:
+            print("🔄 Fetching latest BTC/USDT data...")
+
+            # ✅ Fetch the latest 4-hour interval BTC data
+            limit = 6  # Fetch last 6 candles (24 hours)
+            data = get_btc_data(interval="4h", limit=limit)
+
+            # ✅ Calculate VWAPs dynamically
+            data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP")
+            data = calculate_vwap(data, period_candles=6, name="Daily VWAP")
+
+            # ✅ Check Trading Condition
+            if data["4-Hourly VWAP"].iloc[-1] > data["Daily VWAP"].iloc[-1]:
+                print("✅ Condition Met: 4H VWAP > Daily VWAP")
+                create_order()  # 🚀 Execute trade
+            else:
+                print("❌ Condition Not Met: No trade executed.")
+
+            # ✅ Wait before fetching new data (e.g., every 10 seconds)
+            time.sleep(10)
+
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            time.sleep(10)  # Wait before retrying
+            
 
 if __name__ == "__main__":
-    # Fetch the latest 4-hour interval daily BTC data
-    limit = 6
-    data = get_btc_data(interval="4h", limit=limit)
-    
-    data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP") # Daily VWAP
-    data = calculate_vwap(data, period_candles=6, name="Daily VWAP") # Weekly VWAP
-    
-    if data["4-Hourly VWAP"].iloc[-1] > data["Daily VWAP"].iloc[-1]:
-        create_order()
-    
-    
-
-
-    
+    # ✅ Run the Trading Bot
+    run_trading_bot()
+       
