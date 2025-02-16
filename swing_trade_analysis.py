@@ -139,8 +139,14 @@ def update_graph(n_intervals):
                                         "MACD Indicator"))
 
     # --- Price Chart with Fibonacci Levels & Moving Averages ---
-    fig.add_trace(go.Scatter(x=data["timestamp"], y=data["close"], mode="lines",
-                             name="BTC/USDT Price", line=dict(color="blue")), row=1, col=1)
+    fig.add_trace(go.Candlestick(
+        x=data["timestamp"],  # Time
+        open=data["open"],    # Open Price
+        high=data["high"],    # High Price
+        low=data["low"],      # Low Price
+        close=data["close"],  # Close Price
+        name="BTC/USDT"
+    ))
 
     for level, price in fib_levels.items():
         fig.add_trace(go.Scatter(x=[data["timestamp"].iloc[0], data["timestamp"].iloc[-1]], 
