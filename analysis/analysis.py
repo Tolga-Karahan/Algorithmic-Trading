@@ -131,7 +131,7 @@ def update_graph(n_intervals):
     data = calculate_macd(data)
     data = calculate_moving_averages(data)
     data = calculate_vwap(data, period_candles=1, name="4-Hourly VWAP") # Daily VWAP
-    data = calculate_vwap(data, period_candles=4*6, name="Daily VWAP") # Weekly VWAP
+    data = calculate_vwap(data, period_candles=6, name="Daily VWAP") # Weekly VWAP
 
     # Create a live chart with 3 subplots: Price, RSI, MACD
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, shared_yaxes=True,vertical_spacing=0.1,
