@@ -14,8 +14,10 @@ def get_start_time(year, month, day, hour=0, minute=0, second=0):
     timestamp_ms = int(dt.timestamp() * 1000)  # Convert to milliseconds
     return timestamp_ms
 
-def get_btc_data(interval, limit, start_time=get_start_time(2024, 1, 1)):
-    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}&startTime={start_time}"
+def get_btc_data(interval, limit, start_time=None):
+    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
+    if start_time:
+        url += f"&startTime={start_time}"
     response = requests.get(url).json()
     
     new_data = pd.DataFrame(response, columns=["timestamp", "open", "high", "low", "close", "volume", 
@@ -28,7 +30,8 @@ def get_btc_data(interval, limit, start_time=get_start_time(2024, 1, 1)):
     return new_data[["timestamp", "open", "high", "low", "close", "volume"]]
 
 # Function to calculate Fibonacci retracement levels
-def calculate_fibonacci_levels(df):
+def calculate_fibonacci_levels(df, lookback=300):
+    df = df.tail(lookback)
     max_price = df["high"].max()
     min_price = df["low"].min()
 
@@ -102,7 +105,7 @@ app = dash.Dash(__name__)
 app.layout = html.Div([
     html.H1("Live Bitcoin (BTC/USDT) Price with Moving Averages, Fibonacci, RSI & MACD", style={'text-align': 'center'}),
     dcc.Graph(id='live-graph'),
-    dcc.Interval(id='interval-component', interval=5000, n_intervals=0)  # Refresh every 5 seconds
+    dcc.Interval(id='interval-component', interval=60000, n_intervals=0)  # Refresh every 5 seconds
 ])
 
 # Callback function to update the graph with real-time data
@@ -113,12 +116,11 @@ app.layout = html.Div([
 def update_graph(n_intervals):
     
     # Fetch the latest 4-hour BTC data
-    limit = 400
+    limit = 1200
     days = limit/6 # total_candlesticks/n_candle_stick_per_day
     start_time = datetime.date.today() - datetime.timedelta(days=days)
     data = get_btc_data(interval="4h",
-                        limit=limit,
-                        start_time=get_start_time(year=start_time.year, month=start_time.month, day=start_time.day))
+                        limit=limit)
     
     # Compute Fibonacci levels
     fib_levels = calculate_fibonacci_levels(data)
