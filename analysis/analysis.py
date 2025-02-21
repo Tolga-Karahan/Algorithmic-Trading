@@ -123,8 +123,8 @@ def update_graph(n_intervals):
     data = get_btc_data(interval="4h",
                         limit=limit)
     
-    # Compute Fibonacci levels
-    fib_levels = calculate_fibonacci_levels(data)
+    # Compute Fibonacci levels for two weeks
+    fib_levels = calculate_fibonacci_levels(data, lookback=150)
 
     # Compute RSI, MACD, and Moving Averages
     data = calculate_rsi(data)
