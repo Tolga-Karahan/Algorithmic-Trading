@@ -174,4 +174,4 @@ if __name__ == "__main__":
     print(df_scored[["Ticker", "Composite Score", "Weight"]])
 
     if args.save_to_excel:
-        df_scored.to_excel("scored_quantitative_portfolio_with_roe.xlsx", index=False)
+        df_scored.to_excel("scored_quantitative_portfolio.xlsx", index=False)
