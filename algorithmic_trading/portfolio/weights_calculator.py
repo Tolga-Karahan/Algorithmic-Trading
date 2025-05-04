@@ -16,7 +16,40 @@ def parse_args():
         help="If provided, saves the output DataFrame to an Excel file",
     )
 
+    parser.add_argument(
+        "--tickers_file",
+        type=str,
+        default=None,
+        help="If provided, read tickers from a file",
+    )
+
     return parser.parse_args()
+
+
+def get_tickers(path):
+    """Read tickers from a local file."""
+    if path:
+        print("Reading tickers from the specified file!")
+        with open(path, "r") as f:
+            return f.read().split("\n")[:-1]
+    else:
+        print("No tickers file is provided, returning default tickers!")
+        return [
+            "MSFT",
+            "META",
+            "NVDA",
+            "AMZN",
+            "GOOGL",
+            "LB",
+            "AMD",
+            "FIX",
+            "ASML",
+            "PLTR",
+            "RKLB",
+            "ADBE",
+            "SOFI",
+            "UBER",
+        ]
 
 
 def calculate_metrics(tickers):
@@ -153,22 +186,7 @@ def compute_scores(df):
 
 if __name__ == "__main__":
     args = parse_args()
-    tickers = [
-        "MSFT",
-        "META",
-        "NVDA",
-        "AMZN",
-        "GOOGL",
-        "LB",
-        "AMD",
-        "FIX",
-        "ASML",
-        "PLTR",
-        "RKLB",
-        "ADBE",
-        "SOFI",
-        "UBER",
-    ]
+    tickers = get_tickers(args.tickers_file)
     df = calculate_metrics(tickers)
     df_scored = compute_scores(df)
     print(df_scored[["Ticker", "Composite Score", "Weight"]])
