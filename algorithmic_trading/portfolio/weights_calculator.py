@@ -188,6 +188,7 @@ if __name__ == "__main__":
     tickers = get_tickers(args.tickers_file)
     df = calculate_metrics(tickers)
     df_scored = compute_scores(df)
+    
     print(
         df_scored[
             [
@@ -208,6 +209,6 @@ if __name__ == "__main__":
             ]
         ]
     )
-
+    
     if args.save_to_excel:
         df_scored.to_excel("scored_quantitative_portfolio.xlsx", index=False)
