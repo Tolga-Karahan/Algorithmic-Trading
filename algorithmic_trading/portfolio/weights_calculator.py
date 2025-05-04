@@ -159,10 +159,10 @@ def compute_scores(df):
         for col in cols:
             if col in df_ranked.columns:
                 if metric_group == "Value":
-                    ranks.append(df_ranked[col].rank(ascending=True))  # Lower is better
+                    ranks.append(df_ranked[col].rank(ascending=False))  # Lower is better
                 else:
                     ranks.append(
-                        df_ranked[col].rank(ascending=False)
+                        df_ranked[col].rank(ascending=True)
                     )  # Higher is better
         df_ranked[f"{metric_group} Score"] = sum(ranks) / len(ranks)
 
@@ -174,9 +174,8 @@ def compute_scores(df):
     )
 
     # Normalize weights
-    df_ranked["Raw Weight"] = 1 / df_ranked["Composite Score"]
     df_ranked["Weight"] = (
-        df_ranked["Raw Weight"] / df_ranked["Raw Weight"].sum()
+        df_ranked["Composite Score"] / df_ranked["Composite Score"].sum()
     ) * 100
     df_ranked.sort_values(by="Weight", ascending=False, inplace=True)
     df_ranked.reset_index(inplace=True)
@@ -189,7 +188,27 @@ if __name__ == "__main__":
     tickers = get_tickers(args.tickers_file)
     df = calculate_metrics(tickers)
     df_scored = compute_scores(df)
-    print(df_scored[["Ticker", "Composite Score", "Weight"]])
-
+    
+    print(
+        df_scored[
+            [
+                "Ticker",
+                "Forward PE",
+                "PEG Ratio",
+                "Net Margin",
+                "FCF Margin",
+                "ROE",
+                "EPS Growth",
+                "Revenue Growth",
+                "FCF Growth",
+                "Value Score",
+                "Profitability Score",
+                "Growth Score",
+                "Composite Score",
+                "Weight",
+            ]
+        ]
+    )
+    
     if args.save_to_excel:
         df_scored.to_excel("scored_quantitative_portfolio.xlsx", index=False)
