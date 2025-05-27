@@ -23,6 +23,20 @@ def parse_args():
         help="If provided, read tickers from a file",
     )
 
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=None,
+        help="If a capital amount is provided, calculate allocated capital for each stock based on calculated weights",
+    )
+
+    parser.add_argument(
+        "--dca_period",
+        type=int,
+        default=None,
+        help="If a dca period is provided, calculate allocated amount at each step for each ticker",
+    )
+
     return parser.parse_args()
 
 
@@ -68,24 +82,13 @@ def calculate_metrics(tickers):
             market_cap = info.get("marketCap")
             total_debt = info.get("totalDebt")
             cash = info.get("totalCash")
-
-            pe_ratio = info.get("forwardPE")
-            eps_current = (
-                financials.loc["Basic EPS"].iloc[0]
-                if not np.isnan(financials.loc["Basic EPS"].iloc[0])
-                else financials.loc["Basic EPS"].iloc[1]
-            )
-            eps_past = (
-                financials.loc["Basic EPS"].iloc[1]
-                if not np.isnan(financials.loc["Basic EPS"].iloc[0])
-                else financials.loc["Basic EPS"].iloc[2]
-            )
-            eps_growth = (
-                (eps_current - eps_past) / eps_past
-                if eps_current and eps_past
-                else None
-            )
-            peg_ratio = pe_ratio / (eps_growth * 100) if pe_ratio and eps_growth else 0
+            
+            pe_ratio = info.get("trailingPE")
+            forward_pe = info.get("forwardPE")
+            forward_eps = info.get("forwardEps")
+            trailing_eps = info.get("trailingEps")
+            eps_growth = info.get("earningsGrowth") if info.get("earningsGrowth") else ((forward_eps - trailing_eps) / trailing_eps)
+            peg_ratio = pe_ratio / (eps_growth * 100) if pe_ratio and eps_growth else (forward_pe / eps_growth * 100)
 
             revenue = (
                 financials.loc["Total Revenue"].iloc[0]
@@ -102,6 +105,8 @@ def calculate_metrics(tickers):
                 if revenue and prev_revenue
                 else None
             )
+            revenue_growth_estimate_current = stock.revenue_estimate.loc[:,"growth"].iloc[-2]
+            revenue_growth_estimate_next = stock.revenue_estimate.loc[:,"growth"].iloc[-1]
 
             net_income = (
                 financials.loc["Net Income"].iloc[0]
@@ -128,13 +133,15 @@ def calculate_metrics(tickers):
             results.append(
                 {
                     "Ticker": ticker,
-                    "Forward PE": pe_ratio,
+                    "Forward PE": info.get("forwardPE"),
                     "PEG Ratio": peg_ratio,
                     "Net Margin": net_margin,
                     "FCF Margin": fcf_margin,
                     "ROE": roe,
                     "EPS Growth": eps_growth,
                     "Revenue Growth": revenue_growth,
+                    "Revenue Growth Estimate Current": revenue_growth_estimate_current,
+                    "Revenue Growth Estimate Next": revenue_growth_estimate_next,
                     "FCF Growth": fcf_growth,
                 }
             )
@@ -151,7 +158,7 @@ def compute_scores(df):
     metrics = {
         "Value": ["Forward PE", "PEG Ratio"],
         "Profitability": ["Net Margin", "FCF Margin", "ROE"],
-        "Growth": ["EPS Growth", "Revenue Growth", "FCF Growth"],
+        "Growth": ["Revenue Growth", "FCF Growth", "Revenue Growth Estimate Current", "Revenue Growth Estimate Next"],
     }
 
     for metric_group, cols in metrics.items():
@@ -169,8 +176,8 @@ def compute_scores(df):
     # Final Composite Score
     df_ranked["Composite Score"] = (
         df_ranked["Value Score"] * 0.4
-        + df_ranked["Profitability Score"] * 0.3
-        + df_ranked["Growth Score"] * 0.3
+        + df_ranked["Profitability Score"] * 0.25
+        + df_ranked["Growth Score"] * 0.35
     )
 
     # Normalize weights
@@ -189,6 +196,15 @@ if __name__ == "__main__":
     df = calculate_metrics(tickers)
     df_scored = compute_scores(df)
     
+    if args.capital:
+        df_scored["Investment Amount"] = args.capital * df_scored["Weight"] / 100
+
+    if args.dca_period:
+        df_scored["DCA"] = df_scored["Investment Amount"] / args.dca_period
+
+    if args.save_to_excel:
+        df_scored.to_excel("scored_quantitative_portfolio.xlsx", index=False)
+
     print(
         df_scored[
             [
@@ -200,12 +216,16 @@ if __name__ == "__main__":
                 "ROE",
                 "EPS Growth",
                 "Revenue Growth",
+                "Revenue Growth Estimate Current",
+                "Revenue Growth Estimate Next",
                 "FCF Growth",
                 "Value Score",
                 "Profitability Score",
                 "Growth Score",
                 "Composite Score",
                 "Weight",
+                "Investment Amount",
+                "DCA",
             ]
         ]
     )
