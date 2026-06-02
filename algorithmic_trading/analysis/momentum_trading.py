@@ -1,3 +1,4 @@
+import time
 import yfinance as yf
 import pandas as pd
 import os
@@ -6,6 +7,7 @@ from tqdm.contrib.concurrent import process_map  # Parallel tqdm
 from multiprocessing import cpu_count, set_start_method
 
 BATCH_SIZE = 300
+MAX_RETRIES = 5
 
 
 def get_us_tickers(n=-1):
@@ -48,11 +50,19 @@ def create_tickers_batch(tickers):
     yield tickers[i*BATCH_SIZE:]
         
 def process_stock(ticker_batch):
-    try:
-        data = yf.download(ticker_batch, period="1d", interval="1m", group_by='ticker', progress=False)
-    except Exception as e:
-        print(f"Batch failed: {e}")
-        return []
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        try:
+            data = yf.download(ticker_batch, period="1d", interval="1m", group_by='ticker', progress=False)
+            break
+        except Exception as e:
+            wait_time = 2 ** attempt
+            print(f"Attempt {attempt + 1} failed: {e} — retrying in {wait_time}s...")
+            time.sleep(wait_time)
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                print("Max retries reached. Skipping batch.")
+                return []
     
     matched = []
     for ticker in ticker_batch:
@@ -89,7 +99,7 @@ def find_stocks():
     # Remove None values (stocks that did not meet criteria)
     results = [res for res in results if res is not None]
 
-    if results:
+    if results[0]:
         return pd.DataFrame(
             results, 
             columns=["Ticker", "Last", "% Change"]
