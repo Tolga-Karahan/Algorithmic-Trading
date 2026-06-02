@@ -8,10 +8,10 @@ green candle with the highest volume in weeks):
        AND its return over the base window to be modest, so we don't pick up
        stocks that already ripped.
     2. The most recent session is a wide bullish candle (close > open, gain
-       above a threshold) that closes at a multi-week high (breakout).
-    3. That breakout day's volume is meaningfully larger than the recent
-       average volume — the "thrust" that often marks the start of a new leg.
-    4. The breakout closes above its 50-day SMA (stage-2-ish confirmation).
+       above a threshold).
+    3. That day's volume is meaningfully larger than the recent average
+       volume — the "thrust" that often marks the start of a new leg.
+    4. The candle closes above its 50-day SMA (stage-2-ish confirmation).
 
 Run:
     poetry run python -m algorithmic_trading.analysis.early_uptrend_scanner
@@ -19,9 +19,11 @@ Run:
 
 import argparse
 import contextlib
+import datetime as dt
 import io
 import logging
 import os
+import sys
 import time
 import pandas as pd
 import yfinance as yf
@@ -31,6 +33,8 @@ from tqdm.contrib.concurrent import process_map
 
 
 VERBOSE = False
+SCAN_START: dt.date | None = None  # inclusive; if None, only scan most recent bar
+SCAN_END: dt.date | None = None    # inclusive
 
 
 def _configure_logging(verbose: bool):
@@ -55,17 +59,20 @@ def _maybe_silence_stderr():
 
 # --- scan parameters ---------------------------------------------------------
 LOOKBACK_DAYS = 120         # how much daily history to pull per ticker
-BASE_DAYS = 40              # window used to characterize the "base"
-BREAKOUT_HIGH_DAYS = 20     # today's close must exceed prior N-day high
+BASE_DAYS = 20              # window used to characterize the "base"
 VOL_AVG_DAYS = 20           # window for average-volume comparison
 MIN_VOL_RATIO = 1.7         # today's vol / avg vol must be >= this
 MIN_DAILY_GAIN_PCT = 3.0    # today's % gain (close vs prev close) >= this
-MAX_BASE_RETURN_PCT = 10.0  # base-window return must be <= this (still quiet)
-MAX_BASE_DRAWUP_PCT = 20.0  # high/low ratio over base <= this (no prior rip)
+MAX_BASE_RETURN_PCT = 20.0  # base-window return must be <= this (still quiet)
+MAX_BASE_DRAWUP_PCT = 30.0  # high/low ratio over base <= this (no prior rip)
 SMA_LEN = 50                # confirmation MA
 
 BATCH_SIZE = 200
 MAX_RETRIES = 3
+
+# Minimum number of trading days required to evaluate the setup on a single bar.
+# SMA50 comes from Yahoo's API, so we only need enough bars for the base & volume windows.
+MIN_REQUIRED_BARS = max(BASE_DAYS, VOL_AVG_DAYS) + 2
 
 
 def _is_common_stock(ticker: str) -> bool:
@@ -140,19 +147,26 @@ def batched(items, size):
 
 
 def download_batch(tickers):
-    """Daily bars for a batch with simple retry."""
+    """Daily bars for a batch with simple retry. Honors SCAN_START/SCAN_END if set."""
+    kwargs = dict(
+        tickers=tickers,
+        interval="1d",
+        group_by="ticker",
+        progress=False,
+        auto_adjust=False,
+        threads=True,
+    )
+    if SCAN_START and SCAN_END:
+        # yfinance `end` is exclusive — add one day so SCAN_END is included.
+        kwargs["start"] = SCAN_START.isoformat()
+        kwargs["end"] = (SCAN_END + dt.timedelta(days=1)).isoformat()
+    else:
+        kwargs["period"] = f"{LOOKBACK_DAYS}d"
+
     for attempt in range(MAX_RETRIES):
         try:
             with _maybe_silence_stderr():
-                return yf.download(
-                    tickers,
-                    period=f"{LOOKBACK_DAYS}d",
-                    interval="1d",
-                    group_by="ticker",
-                    progress=False,
-                    auto_adjust=False,
-                    threads=True,
-                )
+                return yf.download(**kwargs)
         except Exception as e:
             wait = 2 ** attempt
             if VERBOSE:
@@ -161,15 +175,30 @@ def download_batch(tickers):
     return None
 
 
+def _fetch_sma50(ticker):
+    """Pull Yahoo's 50-day moving average via fast_info. Snapshot of CURRENT value."""
+    try:
+        val = yf.Ticker(ticker).fast_info["fiftyDayAverage"]
+        return float(val) if val is not None else None
+    except Exception as e:
+        if VERBOSE:
+            print(f"fast_info SMA fetch failed for {ticker}: {e}")
+        return None
+
+
 def evaluate(ticker, df):
-    """Return a result dict if `ticker` matches the early-uptrend setup, else None."""
-    if df is None or df.empty or len(df) < max(BASE_DAYS, SMA_LEN) + 2:
+    """Return a result dict if `ticker` matches the early-uptrend setup, else None.
+
+    Evaluates the LAST bar of `df` as the candidate day. Cheap filters run first;
+    the SMA50 (an HTTP call to Yahoo's fast_info) runs only if everything else passes.
+    """
+    if df is None or df.empty or len(df) < MIN_REQUIRED_BARS:
         return None
     if not {"Open", "High", "Low", "Close", "Volume"}.issubset(df.columns):
         return None
 
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-    if len(df) < max(BASE_DAYS, SMA_LEN) + 2:
+    if len(df) < MIN_REQUIRED_BARS:
         return None
 
     today = df.iloc[-1]
@@ -180,12 +209,7 @@ def evaluate(ticker, df):
     if daily_gain_pct < MIN_DAILY_GAIN_PCT or today["Close"] <= today["Open"]:
         return None
 
-    # 2) Breakout: today's close above prior BREAKOUT_HIGH_DAYS high (exclusive of today).
-    prior_high = df["Close"].iloc[-(BREAKOUT_HIGH_DAYS + 1):-1].max()
-    if today["Close"] <= prior_high:
-        return None
-
-    # 3) Volume thrust.
+    # 2) Volume thrust.
     avg_vol = df["Volume"].iloc[-(VOL_AVG_DAYS + 1):-1].mean()
     if avg_vol <= 0:
         return None
@@ -193,7 +217,7 @@ def evaluate(ticker, df):
     if vol_ratio < MIN_VOL_RATIO:
         return None
 
-    # 4) The base was quiet — we want to catch the START of a move, not chase one.
+    # 3) The base was quiet — we want to catch the START of a move, not chase one.
     base = df["Close"].iloc[-(BASE_DAYS + 1):-1]
     base_return_pct = (base.iloc[-1] - base.iloc[0]) / base.iloc[0] * 100
     base_drawup_pct = (base.max() - base.min()) / base.min() * 100
@@ -202,9 +226,9 @@ def evaluate(ticker, df):
     if base_drawup_pct > MAX_BASE_DRAWUP_PCT:
         return None
 
-    # 5) Trend confirmation — close above SMA50.
-    sma = df["Close"].rolling(SMA_LEN).mean().iloc[-1]
-    if pd.isna(sma) or today["Close"] <= sma:
+    # 4) Trend confirmation — close above SMA50 (fetched from Yahoo API).
+    sma = _fetch_sma50(ticker)
+    if sma is None or today["Close"] <= sma:
         return None
 
     return {
@@ -213,9 +237,6 @@ def evaluate(ticker, df):
         "Close": round(float(today["Close"]), 2),
         "Gain %": round(float(daily_gain_pct), 2),
         "Vol x Avg": round(float(vol_ratio), 2),
-        "Breakout vs N-day high %": round(
-            float((today["Close"] - prior_high) / prior_high * 100), 2
-        ),
         "Base Return %": round(float(base_return_pct), 2),
         "Base Drawup %": round(float(base_drawup_pct), 2),
         f"SMA{SMA_LEN}": round(float(sma), 2),
@@ -247,7 +268,13 @@ def scan_batch(batch):
 
 def scan():
     tickers = get_tickers()
-    print(f"Scanning {len(tickers)} tickers for early-uptrend setups...")
+    if SCAN_START and SCAN_END:
+        print(
+            f"Scanning {len(tickers)} tickers using data window "
+            f"{SCAN_START} → {SCAN_END} (evaluating last bar in window)..."
+        )
+    else:
+        print(f"Scanning {len(tickers)} tickers (latest bar) for early-uptrend setups...")
 
     batches = list(batched(tickers, BATCH_SIZE))
     workers = max(cpu_count() - 1, 1)
@@ -266,16 +293,73 @@ def scan():
     return df
 
 
+def _parse_date(s: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"date must be YYYY-MM-DD (got {s!r})") from e
+
+
+def _validate_range(start: dt.date, end: dt.date) -> str | None:
+    """Return an error message if the range is unusable, else None."""
+    if end < start:
+        return f"--end ({end}) must be on or after --start ({start})."
+    if start > dt.date.today():
+        return f"--start ({start}) is in the future."
+    # We need ~MIN_REQUIRED_BARS trading days inside the window. Estimate
+    # trading days as ~5/7 of calendar days; require a small safety margin.
+    calendar_days = (end - start).days + 1
+    est_trading_days = int(calendar_days * 5 / 7)
+    if est_trading_days < MIN_REQUIRED_BARS:
+        min_calendar = int(MIN_REQUIRED_BARS * 7 / 5) + 5  # round up + margin
+        return (
+            f"Date range is too short: {calendar_days} calendar days "
+            f"(~{est_trading_days} trading days), but the {BASE_DAYS}-day base + "
+            f"{VOL_AVG_DAYS}-day volume window need at least {MIN_REQUIRED_BARS} "
+            f"trading days. Use a range of at least ~{min_calendar} calendar days."
+        )
+    return None
+
+
 def main():
-    global VERBOSE
+    global VERBOSE, SCAN_START, SCAN_END
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Show yfinance download/HTTP errors (suppressed by default).",
     )
+    parser.add_argument(
+        "--start", type=_parse_date, default=None,
+        help="Start of scan range (inclusive, YYYY-MM-DD). Requires --end.",
+    )
+    parser.add_argument(
+        "--end", type=_parse_date, default=None,
+        help="End of scan range (inclusive, YYYY-MM-DD). Defaults to today when --start is set.",
+    )
     args = parser.parse_args()
+
     VERBOSE = args.verbose
     _configure_logging(VERBOSE)
+
+    if args.start or args.end:
+        start = args.start
+        end = args.end or dt.date.today()
+        if start is None:
+            parser.error("--end given without --start")
+        err = _validate_range(start, end)
+        if err:
+            print(err, file=sys.stderr)
+            sys.exit(2)
+        SCAN_START = start
+        SCAN_END = end
+        if end < dt.date.today():
+            print(
+                f"warning: --end {end} is in the past, but Yahoo's fast_info SMA{SMA_LEN} "
+                f"reflects the CURRENT value, not the value as of {end}. "
+                f"Results for backdated windows will compare {end}'s close against today's SMA.",
+                file=sys.stderr,
+            )
+
     scan()
 
 
