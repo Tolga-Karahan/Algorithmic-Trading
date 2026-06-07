@@ -41,10 +41,10 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     DEFAULT_MIN_ETF_ASSETS,
     DEFAULT_SQUEEZE_BARS,
     DEFAULT_SQUEEZE_MAX_RANGE_PCT,
-    DEFAULT_SQUEEZE_MAX_BODY_PCT,
     DEFAULT_SQUEEZE_BREAKOUT_PCT,
-    DEFAULT_SQUEEZE_RANGE_MULT,
     DEFAULT_SQUEEZE_DIRECTION,
+    DEFAULT_SQUEEZE_TIMEFRAME,
+    SQUEEZE_TIMEFRAMES,
     MIN_DAILY_GAIN_PCT,
     MIN_VOL_RATIO,
 )
@@ -183,16 +183,7 @@ def _build_layout():
                         ),
                     ),
                     _labelled(
-                        "Include ETFs",
-                        dcc.Checklist(
-                            id="include-etfs",
-                            options=[{"label": " include large ETFs in universe", "value": "yes"}],
-                            value=[], inline=True,
-                            style={"display": "inline-block"},
-                        ),
-                    ),
-                    _labelled(
-                        "Min ETF net assets (e.g. 15B, ignored if ETFs not included)",
+                        "Min ETF net assets (ETFs always included; raise to e.g. 999T to exclude)",
                         dcc.Input(
                             id="min-etf-assets", type="text",
                             value="15B", style={"width": "120px"},
@@ -285,6 +276,16 @@ def _build_layout():
                                     value=DEFAULT_SQUEEZE_DIRECTION,
                                     clearable=False,
                                     style={"width": "240px"},
+                                ),
+                            ),
+                            _labelled(
+                                "Timeframe (candle interval)",
+                                dcc.Dropdown(
+                                    id="squeeze-timeframe-input",
+                                    options=[{"label": tf, "value": tf} for tf in SQUEEZE_TIMEFRAMES],
+                                    value=DEFAULT_SQUEEZE_TIMEFRAME,
+                                    clearable=False,
+                                    style={"width": "140px"},
                                 ),
                             ),
                         ],
@@ -552,7 +553,6 @@ _MODE_DESCRIPTIONS = {
     State("mode", "value"),
     State("market-cap", "value"),
     State("min-daily-volume", "value"),
-    State("include-etfs", "value"),
     State("min-etf-assets", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
@@ -568,15 +568,17 @@ _MODE_DESCRIPTIONS = {
     State("squeeze-max-range-input", "value"),
     State("squeeze-breakout-input", "value"),
     State("squeeze-direction-input", "value"),
+    State("squeeze-timeframe-input", "value"),
     prevent_initial_call=True,
 )
 def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
-               include_etfs_value, min_etf_assets_str,
+               min_etf_assets_str,
                start_date, end_date,
                min_gain, min_vol_ratio,
                min_surprise, min_accel, min_up7d,
                target_lookback, min_raisers, min_raise_pct,
-               squeeze_bars, squeeze_max_range, squeeze_breakout, squeeze_direction):
+               squeeze_bars, squeeze_max_range,
+               squeeze_breakout, squeeze_direction, squeeze_timeframe):
     """Fast: parse params, prep universe, show descriptive status, hand off to executor."""
     cap_usd = None
     if market_cap_str and market_cap_str.strip():
@@ -587,16 +589,12 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
 
     vol_filter = float(min_daily_volume) if min_daily_volume and float(min_daily_volume) > 0 else None
 
-    include_etfs = bool(include_etfs_value)
-    etf_assets_filter = None
-    if include_etfs:
-        if min_etf_assets_str and min_etf_assets_str.strip():
-            try:
-                etf_assets_filter = _parse_market_cap(min_etf_assets_str)
-            except Exception as e:
-                return no_update, f"❌ Invalid min ETF assets: {e}"
-        else:
-            etf_assets_filter = DEFAULT_MIN_ETF_ASSETS
+    etf_assets_filter = DEFAULT_MIN_ETF_ASSETS
+    if min_etf_assets_str and min_etf_assets_str.strip():
+        try:
+            etf_assets_filter = _parse_market_cap(min_etf_assets_str)
+        except Exception as e:
+            return no_update, f"❌ Invalid min ETF assets: {e}"
 
     try:
         tickers = _prepare_universe(
@@ -604,7 +602,6 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
             min_market_cap_usd=cap_usd,
             refresh_market_caps=False,
             min_daily_volume=vol_filter,
-            include_etfs=include_etfs,
             min_etf_assets=etf_assets_filter,
         )
     except Exception as e:
@@ -637,6 +634,7 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
         "squeeze_max_range": squeeze_max_range,
         "squeeze_breakout": squeeze_breakout,
         "squeeze_direction": squeeze_direction,
+        "squeeze_timeframe": squeeze_timeframe,
     }
     return payload, status
 
@@ -677,18 +675,13 @@ def _execute_scan(trigger):
                 float(trigger["min_raise_pct"]),
             )
         elif mode == "squeeze":
-            from algorithmic_trading.analysis.us_stock_scanner import (
-                DEFAULT_SQUEEZE_MAX_BODY_PCT as _BODY,
-                DEFAULT_SQUEEZE_RANGE_MULT as _MULT,
-            )
             df = scan_squeeze(
                 tickers,
                 int(trigger["squeeze_bars"]),
                 float(trigger["squeeze_max_range"]),
-                _BODY,
                 float(trigger["squeeze_breakout"]),
-                _MULT,
                 trigger["squeeze_direction"],
+                trigger["squeeze_timeframe"],
             )
         else:
             return [], [], f"Unknown mode: {mode}"

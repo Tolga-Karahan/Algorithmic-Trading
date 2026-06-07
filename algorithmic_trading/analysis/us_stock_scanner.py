@@ -178,10 +178,10 @@ DEFAULT_MIN_ETF_ASSETS = 15_000_000_000   # $15B
 
 DEFAULT_SQUEEZE_BARS = 6                 # bars of tight consolidation required before breakout
 DEFAULT_SQUEEZE_MAX_RANGE_PCT = 4.0      # high-low spread over those bars must be <= this % of midpoint
-DEFAULT_SQUEEZE_MAX_BODY_PCT = 1.5       # no single body in the consolidation may exceed this %
 DEFAULT_SQUEEZE_BREAKOUT_PCT = 1.5       # today's close must clear the consol range by at least this %
-DEFAULT_SQUEEZE_RANGE_MULT = 1.5         # today's bar's high-low must be >= this x avg consol range
 DEFAULT_SQUEEZE_DIRECTION = "both"       # 'up', 'down', or 'both'
+DEFAULT_SQUEEZE_TIMEFRAME = "1d"         # '1d' (default), '4h', '1h'
+SQUEEZE_TIMEFRAMES = ("1d", "4h", "1h")
 
 DEFAULT_MIN_SURPRISE_PCT = 10.0
 DEFAULT_MIN_REVISION_ACCEL = 2.0     # 7d pace must be >= this x 30d pace
@@ -638,13 +638,21 @@ def _resolve_fetch_window() -> tuple[dt.date, dt.date]:
     return end - dt.timedelta(days=LOOKBACK_DAYS), end
 
 
-def fetch_history(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame | None:
-    """Hit Yahoo's chart endpoint directly via curl_cffi. Returns OHLCV DataFrame or None."""
+def fetch_history(
+    ticker: str, start: dt.date, end: dt.date, interval: str = "1d",
+) -> pd.DataFrame | None:
+    """Hit Yahoo's chart endpoint directly via curl_cffi. Returns OHLCV DataFrame or None.
+
+    Supported intervals: '1d' (default), '1h', '4h'. For '4h' we fetch 1h bars and
+    resample. Intraday bars older than ~2 years aren't available from Yahoo.
+    """
+    # 4h not natively supported — fetch 1h and resample below.
+    fetch_interval = "1h" if interval == "4h" else interval
     session = _get_session()
     params = {
         "period1": _to_unix(start),
         "period2": _to_unix(end + dt.timedelta(days=1)),
-        "interval": "1d",
+        "interval": fetch_interval,
     }
     for attempt in range(MAX_RETRIES):
         try:
@@ -684,11 +692,25 @@ def fetch_history(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame | N
     }, index=pd.to_datetime(timestamps, unit="s"))
     df.index.name = "Date"
     df = df.dropna()
-    # Drop today's bar — during market hours Yahoo returns an intraday/partial
-    # candle for the current trading day, which would skew gain%, volume, etc.
-    # The setup requires completed end-of-day candles.
-    today = dt.date.today()
-    df = df[df.index.date < today]
+
+    if interval == "4h":
+        # Resample 1h → 4h. Yahoo returns timestamps at the start of each hourly bar.
+        df = df.resample("4h", origin="start_day").agg({
+            "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
+        }).dropna()
+
+    if interval == "1d":
+        # Drop today's bar — during market hours Yahoo returns a partial candle.
+        today = dt.date.today()
+        df = df[df.index.date < today]
+    else:
+        # Intraday: drop the last bar if its window isn't fully closed yet,
+        # and drop any zero-volume bars (after-hours stubs Yahoo returns).
+        interval_hours = {"1h": 1, "4h": 4}[interval]
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=interval_hours)
+        df = df[df.index <= cutoff]
+        df = df[df["Volume"] > 0]
+
     return df
 
 
@@ -754,8 +776,7 @@ def _prepare_universe(
     min_market_cap_usd: float | None,
     refresh_market_caps: bool,
     min_daily_volume: float | None = None,
-    include_etfs: bool = False,
-    min_etf_assets: float | None = None,
+    min_etf_assets: float | None = DEFAULT_MIN_ETF_ASSETS,
 ) -> list[str]:
     """Fetch tickers, apply universe-level filters.
 
@@ -778,7 +799,7 @@ def _prepare_universe(
         )
 
     etfs_kept: list[str] = []
-    if include_etfs and min_etf_assets is not None:
+    if min_etf_assets is not None:
         all_etfs = get_etfs()
         # Pre-filter: only fetch AUM for ETFs with meaningful trading activity.
         # A $15B+ AUM ETF effectively always trades >50k shares/day on average.
@@ -943,21 +964,18 @@ def evaluate_squeeze(
     df,
     consol_bars: int,
     max_range_pct: float,
-    max_body_pct: float,
     breakout_pct: float,
-    range_mult: float,
     direction: str,
 ):
     """Detect a tight consolidation followed by a breakout on the LAST bar.
 
-    Consolidation: prior `consol_bars` bars have:
-      - (max High - min Low) / midpoint <= max_range_pct
-      - every body |Close - Open| / Open <= max_body_pct
+    Consolidation: prior `consol_bars` bars satisfy
+      (max High - min Low) / midpoint <= max_range_pct
 
     Breakout (today, the last bar):
       - close clears the consol range by >= breakout_pct (above high for 'up',
         below low for 'down')
-      - today's high-low >= range_mult x avg high-low during consolidation
+      - today's volume is greater than the previous bar's volume
       - bullish bar for 'up' breakout, bearish bar for 'down' breakout
     """
     if df is None or df.empty:
@@ -968,6 +986,7 @@ def evaluate_squeeze(
         return None
 
     today = df.iloc[-1]
+    prev = df.iloc[-2]
     consol = df.iloc[-(consol_bars + 1):-1]
 
     consol_high = float(consol["High"].max())
@@ -979,13 +998,9 @@ def evaluate_squeeze(
     if consol_range_pct > max_range_pct:
         return None
 
-    bodies_pct = (consol["Close"] - consol["Open"]).abs() / consol["Open"] * 100
-    if (bodies_pct > max_body_pct).any():
-        return None
-
-    avg_range = float((consol["High"] - consol["Low"]).mean())
-    today_range = float(today["High"] - today["Low"])
-    if avg_range <= 0 or today_range < range_mult * avg_range:
+    today_vol = float(today["Volume"])
+    prev_vol = float(prev["Volume"])
+    if prev_vol <= 0 or today_vol <= prev_vol:
         return None
 
     today_close = float(today["Close"])
@@ -995,15 +1010,12 @@ def evaluate_squeeze(
 
     direction_str = None
     breakout_pct_val = 0.0
-    ref_level = None
     if direction in ("up", "both") and up_pct >= breakout_pct and today_close > today_open:
         direction_str = "UP"
         breakout_pct_val = up_pct
-        ref_level = consol_high
     elif direction in ("down", "both") and down_pct >= breakout_pct and today_close < today_open:
         direction_str = "DOWN"
         breakout_pct_val = down_pct
-        ref_level = consol_low
     if direction_str is None:
         return None
 
@@ -1015,7 +1027,7 @@ def evaluate_squeeze(
         "Consol Low": round(consol_low, 2),
         "Consol High": round(consol_high, 2),
         "Breakout %": round(breakout_pct_val, 2),
-        "Today Range x Avg": round(today_range / avg_range, 2),
+        "Vol vs Prev": round(today_vol / prev_vol, 2),
         "Close": round(today_close, 2),
     }
 
@@ -1024,24 +1036,30 @@ def scan_squeeze(
     tickers: list[str],
     consol_bars: int,
     max_range_pct: float,
-    max_body_pct: float,
     breakout_pct: float,
-    range_mult: float,
     direction: str,
+    timeframe: str = DEFAULT_SQUEEZE_TIMEFRAME,
 ):
     print(
-        f"Scanning {len(tickers)} tickers for {consol_bars}-bar tight consolidation "
-        f"→ {direction} breakout (range <= {max_range_pct}%, breakout >= {breakout_pct}%)..."
+        f"Scanning {len(tickers)} tickers on {timeframe} bars for "
+        f"{consol_bars}-bar tight consolidation → {direction} breakout "
+        f"(range <= {max_range_pct}%, breakout >= {breakout_pct}%)..."
     )
     if SCAN_START and SCAN_END:
         print(f"  Using data window {SCAN_START} → {SCAN_END} (evaluating last bar in window)")
 
     start, end = _resolve_fetch_window()
+    # Yahoo caps intraday history at ~730 days; truncate start if needed.
+    if timeframe != "1d":
+        max_start = dt.date.today() - dt.timedelta(days=720)
+        if start < max_start:
+            start = max_start
+
     matches = []
     success = 0
     failed = 0
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-        futures = {ex.submit(fetch_history, t, start, end): t for t in tickers}
+        futures = {ex.submit(fetch_history, t, start, end, timeframe): t for t in tickers}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="squeeze"):
             ticker = futures[fut]
             df = fut.result()
@@ -1052,8 +1070,7 @@ def scan_squeeze(
             try:
                 hit = evaluate_squeeze(
                     ticker, df,
-                    consol_bars, max_range_pct, max_body_pct,
-                    breakout_pct, range_mult, direction,
+                    consol_bars, max_range_pct, breakout_pct, direction,
                 )
                 if hit:
                     matches.append(hit)
@@ -1068,7 +1085,7 @@ def scan_squeeze(
         print("No matches.")
         return pd.DataFrame()
     out = pd.DataFrame(matches).sort_values(
-        by=["Breakout %", "Today Range x Avg"], ascending=False
+        by=["Breakout %", "Vol vs Prev"], ascending=False
     ).reset_index(drop=True)
     print(f"\n{len(out)} match(es):")
     print(out.to_string(index=False))
@@ -1583,8 +1600,7 @@ def scan(
     min_market_cap_usd: float | None = None,
     refresh_market_caps: bool = False,
     min_daily_volume: float | None = None,
-    include_etfs: bool = False,
-    min_etf_assets: float | None = None,
+    min_etf_assets: float | None = DEFAULT_MIN_ETF_ASSETS,
     min_surprise_pct: float = DEFAULT_MIN_SURPRISE_PCT,
     min_revision_accel: float = DEFAULT_MIN_REVISION_ACCEL,
     min_up7d: int = DEFAULT_MIN_UP7D,
@@ -1593,14 +1609,13 @@ def scan(
     min_target_raise_pct: float = DEFAULT_MIN_TARGET_RAISE_PCT,
     squeeze_bars: int = DEFAULT_SQUEEZE_BARS,
     squeeze_max_range_pct: float = DEFAULT_SQUEEZE_MAX_RANGE_PCT,
-    squeeze_max_body_pct: float = DEFAULT_SQUEEZE_MAX_BODY_PCT,
     squeeze_breakout_pct: float = DEFAULT_SQUEEZE_BREAKOUT_PCT,
-    squeeze_range_mult: float = DEFAULT_SQUEEZE_RANGE_MULT,
     squeeze_direction: str = DEFAULT_SQUEEZE_DIRECTION,
+    squeeze_timeframe: str = DEFAULT_SQUEEZE_TIMEFRAME,
 ):
     tickers = _prepare_universe(
         refresh_tickers, min_market_cap_usd, refresh_market_caps, min_daily_volume,
-        include_etfs=include_etfs, min_etf_assets=min_etf_assets,
+        min_etf_assets=min_etf_assets,
     )
     results: dict[str, pd.DataFrame] = {}
     if mode in ("all", "uptrend"):
@@ -1609,8 +1624,8 @@ def scan(
     if mode in ("all", "squeeze"):
         print("\n=== TIGHT-CONSOLIDATION BREAKOUT SCAN ===")
         results["squeeze"] = scan_squeeze(
-            tickers, squeeze_bars, squeeze_max_range_pct, squeeze_max_body_pct,
-            squeeze_breakout_pct, squeeze_range_mult, squeeze_direction,
+            tickers, squeeze_bars, squeeze_max_range_pct,
+            squeeze_breakout_pct, squeeze_direction, squeeze_timeframe,
         )
     if mode in ("all", "earnings"):
         print("\n=== EARNINGS SURPRISE SCAN ===")
@@ -1699,12 +1714,8 @@ def main():
         help=f"Restrict to tickers whose MIN daily volume in the last {MIN_VOLUME_LOOKBACK_DAYS} trading days >= this many shares (default {DEFAULT_MIN_DAILY_VOLUME:,}; pass 0 to disable). Stricter than averages — filters out stocks with quiet days.",
     )
     parser.add_argument(
-        "--include-etfs", action="store_true",
-        help="Also include large ETFs (filtered by --min-etf-assets) in the scan universe.",
-    )
-    parser.add_argument(
         "--min-etf-assets", type=_parse_market_cap, default=None, metavar="N[KMBT]",
-        help=f"For --include-etfs: minimum ETF net assets, e.g. 15B (defaults to ${DEFAULT_MIN_ETF_ASSETS / 1e9:g}B when --include-etfs is set).",
+        help=f"Minimum ETF net assets. ETFs are always included in the universe; raise this (e.g. 999T) to effectively exclude them. Default: ${DEFAULT_MIN_ETF_ASSETS / 1e9:g}B.",
     )
     parser.add_argument(
         "--mode",
@@ -1753,6 +1764,11 @@ def main():
         default=DEFAULT_SQUEEZE_DIRECTION,
         help=f"For --mode squeeze: which breakout direction(s) to catch (default {DEFAULT_SQUEEZE_DIRECTION}).",
     )
+    parser.add_argument(
+        "--squeeze-timeframe", choices=SQUEEZE_TIMEFRAMES,
+        default=DEFAULT_SQUEEZE_TIMEFRAME,
+        help=f"For --mode squeeze: candle interval. '4h'/'1h' use intraday data (capped at ~720 days of history). Default: {DEFAULT_SQUEEZE_TIMEFRAME}.",
+    )
     args = parser.parse_args()
 
     VERBOSE = args.verbose
@@ -1776,8 +1792,7 @@ def main():
         min_market_cap_usd=args.min_market_cap,
         refresh_market_caps=args.refresh_market_caps,
         min_daily_volume=(args.min_daily_volume if args.min_daily_volume > 0 else None),
-        include_etfs=args.include_etfs,
-        min_etf_assets=(args.min_etf_assets if args.min_etf_assets is not None else (DEFAULT_MIN_ETF_ASSETS if args.include_etfs else None)),
+        min_etf_assets=(args.min_etf_assets if args.min_etf_assets is not None else DEFAULT_MIN_ETF_ASSETS),
         min_surprise_pct=args.min_surprise,
         min_revision_accel=args.min_revision_accel,
         min_up7d=args.min_up7d,
@@ -1788,6 +1803,7 @@ def main():
         squeeze_max_range_pct=args.squeeze_max_range,
         squeeze_breakout_pct=args.squeeze_breakout,
         squeeze_direction=args.squeeze_direction,
+        squeeze_timeframe=args.squeeze_timeframe,
     )
 
 
