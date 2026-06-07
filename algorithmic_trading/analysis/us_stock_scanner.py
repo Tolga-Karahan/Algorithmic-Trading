@@ -980,7 +980,7 @@ def evaluate_squeeze(
     """
     if df is None or df.empty:
         return None
-    needed = consol_bars + 2
+    needed = consol_bars + 1  # consol_bars of history + 1 breakout bar (today)
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
     if len(df) < needed:
         return None

@@ -190,7 +190,7 @@ def _build_layout():
                         ),
                     ),
                     _labelled(
-                        "Date range (only used by uptrend / earnings)",
+                        "Date range (only used by uptrend / earnings / squeeze)",
                         dcc.DatePickerRange(
                             id="date-range",
                             display_format="YYYY-MM-DD",
