@@ -597,9 +597,14 @@ def _save_etf_assets_cache(assets: dict[str, float]):
         json.dump(assets, f)
 
 
-def get_etf_assets(tickers: list[str], force_refresh: bool = False) -> dict[str, float]:
-    """Cached ETF net-assets (AUM) lookup. Fetches missing per-ticker in parallel."""
-    cached: dict[str, float] = {}
+def get_etf_assets(tickers: list[str], force_refresh: bool = False) -> dict[str, float | None]:
+    """Cached ETF net-assets (AUM) lookup. Fetches missing per-ticker in parallel.
+
+    Yahoo doesn't expose totalAssets for some ETFs (small/new/odd). We cache
+    `None` for those so we don't re-fetch them every run. The filter step
+    treats None as 'fails threshold' via `(aum.get(t) or 0) >= threshold`.
+    """
+    cached: dict[str, float | None] = {}
     if not force_refresh:
         loaded = _load_etf_assets_cache(ETF_ASSETS_CACHE_TTL_SECONDS)
         if loaded is not None:
@@ -609,18 +614,19 @@ def get_etf_assets(tickers: list[str], force_refresh: bool = False) -> dict[str,
     if missing:
         if VERBOSE:
             print(f"ETF assets: {len(cached)} cached, {len(missing)} to fetch")
-        results: dict[str, float] = {}
+        results: dict[str, float | None] = {}
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
             futures = {ex.submit(fetch_etf_total_assets, t): t for t in missing}
             for fut in tqdm(as_completed(futures), total=len(futures), desc="ETF assets"):
                 ticker = futures[fut]
                 try:
-                    val = fut.result()
-                    if val is not None:
-                        results[ticker] = val
+                    # Cache the result either way — None means "Yahoo has no AUM";
+                    # without this they'd be re-fetched forever.
+                    results[ticker] = fut.result()
                 except Exception as e:
                     if VERBOSE:
                         print(f"ETF assets {ticker}: {e}")
+                    results[ticker] = None
         cached.update(results)
         _save_etf_assets_cache(cached)
     elif VERBOSE:
