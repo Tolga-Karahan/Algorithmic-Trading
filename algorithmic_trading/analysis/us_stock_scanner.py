@@ -164,7 +164,11 @@ CRUMB_BOOTSTRAP_URL = "https://finance.yahoo.com/quote/AAPL/"
 MARKETCAP_BATCH_SIZE = 100
 MARKETCAP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 QUOTE_METRICS_CACHE_FILENAME = ".us_quote_metrics_cache.json"
-DEFAULT_MIN_AVG_VOLUME = 200_000
+
+DEFAULT_MIN_DAILY_VOLUME = 200_000
+MIN_VOLUME_LOOKBACK_DAYS = 30          # trading days to check
+MIN_VOLUME_CACHE_FILENAME = ".us_min_volumes_cache.json"
+MIN_VOLUME_CACHE_TTL_SECONDS = 24 * 3600
 
 DEFAULT_SQUEEZE_BARS = 6                 # bars of tight consolidation required before breakout
 DEFAULT_SQUEEZE_MAX_RANGE_PCT = 4.0      # high-low spread over those bars must be <= this % of midpoint
@@ -408,6 +412,72 @@ def get_quote_metrics(tickers: list[str], force_refresh: bool = False) -> dict[s
     return cached
 
 
+def fetch_min_volume(ticker: str, days: int = MIN_VOLUME_LOOKBACK_DAYS) -> float | None:
+    """Min daily share volume over the last `days` trading days (excluding today)."""
+    end = dt.date.today()
+    start = end - dt.timedelta(days=days * 2)  # weekends/holidays buffer
+    df = fetch_history(ticker, start, end)
+    if df is None or df.empty:
+        return None
+    recent = df["Volume"].tail(days)
+    if recent.empty:
+        return None
+    return float(recent.min())
+
+
+def _min_volume_cache_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), MIN_VOLUME_CACHE_FILENAME)
+
+
+def _load_min_volume_cache(max_age_seconds: int) -> dict[str, float] | None:
+    path = _min_volume_cache_path()
+    if not os.path.exists(path):
+        return None
+    if time.time() - os.path.getmtime(path) > max_age_seconds:
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_min_volume_cache(vols: dict[str, float]):
+    with open(_min_volume_cache_path(), "w") as f:
+        json.dump(vols, f)
+
+
+def get_min_volumes(tickers: list[str], force_refresh: bool = False) -> dict[str, float]:
+    """Cached min-daily-volume-in-last-30-days for `tickers`. Cache TTL 24h."""
+    cached: dict[str, float] = {}
+    if not force_refresh:
+        loaded = _load_min_volume_cache(MIN_VOLUME_CACHE_TTL_SECONDS)
+        if loaded is not None:
+            cached = loaded
+
+    missing = [t for t in tickers if t not in cached]
+    if missing:
+        if VERBOSE:
+            print(f"min volumes: {len(cached)} cached, {len(missing)} to fetch")
+        results: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            futures = {ex.submit(fetch_min_volume, t): t for t in missing}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="min volumes"):
+                ticker = futures[fut]
+                try:
+                    val = fut.result()
+                    if val is not None:
+                        results[ticker] = val
+                except Exception as e:
+                    if VERBOSE:
+                        print(f"min volume {ticker}: {e}")
+        cached.update(results)
+        _save_min_volume_cache(cached)
+    elif VERBOSE:
+        print(f"min volumes: all {len(tickers)} served from cache")
+    return cached
+
+
 def _to_unix(d: dt.date) -> int:
     return int(dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc).timestamp())
 
@@ -535,34 +605,37 @@ def _prepare_universe(
     refresh_tickers: bool,
     min_market_cap_usd: float | None,
     refresh_market_caps: bool,
-    min_avg_volume: float | None = None,
+    min_daily_volume: float | None = None,
 ) -> list[str]:
-    """Fetch tickers and apply universe-level filters (market cap, avg volume)."""
+    """Fetch tickers, apply universe-level filters (market cap, min daily volume).
+
+    Filter order is intentional: market cap first (cheap, from cached v7 quote),
+    then the strict per-ticker min daily volume from chart history (slower).
+    """
     tickers = get_tickers(force_refresh=refresh_tickers)
-    if min_market_cap_usd is None and min_avg_volume is None:
-        return tickers
 
-    metrics = get_quote_metrics(tickers, force_refresh=refresh_market_caps)
-    before = len(tickers)
-
-    def passes(t: str) -> bool:
-        m = metrics.get(t) or {}
-        if min_market_cap_usd is not None and (m.get("market_cap") or 0) < min_market_cap_usd:
-            return False
-        if min_avg_volume is not None and (m.get("avg_volume") or 0) < min_avg_volume:
-            return False
-        return True
-
-    tickers = [t for t in tickers if passes(t)]
-    filters = []
     if min_market_cap_usd is not None:
-        filters.append(f"cap >= {_format_market_cap(min_market_cap_usd)}")
-    if min_avg_volume is not None:
-        filters.append(f"avg vol >= {int(min_avg_volume):,}")
-    print(
-        f"Universe filter: kept {len(tickers)}/{before} tickers "
-        f"({', '.join(filters)}; coverage: {len(metrics)}/{before})"
-    )
+        metrics = get_quote_metrics(tickers, force_refresh=refresh_market_caps)
+        before = len(tickers)
+        tickers = [
+            t for t in tickers
+            if (metrics.get(t, {}).get("market_cap") or 0) >= min_market_cap_usd
+        ]
+        print(
+            f"Market-cap filter: kept {len(tickers)}/{before} tickers "
+            f"with cap >= {_format_market_cap(min_market_cap_usd)}"
+        )
+
+    if min_daily_volume is not None:
+        min_vols = get_min_volumes(tickers)
+        before = len(tickers)
+        tickers = [t for t in tickers if (min_vols.get(t) or 0) >= min_daily_volume]
+        print(
+            f"Min-daily-volume filter: kept {len(tickers)}/{before} tickers "
+            f"with min volume >= {int(min_daily_volume):,} over last "
+            f"{MIN_VOLUME_LOOKBACK_DAYS} trading days"
+        )
+
     return tickers
 
 
@@ -1338,7 +1411,7 @@ def scan(
     refresh_tickers: bool = False,
     min_market_cap_usd: float | None = None,
     refresh_market_caps: bool = False,
-    min_avg_volume: float | None = None,
+    min_daily_volume: float | None = None,
     min_surprise_pct: float = DEFAULT_MIN_SURPRISE_PCT,
     min_revision_accel: float = DEFAULT_MIN_REVISION_ACCEL,
     min_up7d: int = DEFAULT_MIN_UP7D,
@@ -1353,7 +1426,7 @@ def scan(
     squeeze_direction: str = DEFAULT_SQUEEZE_DIRECTION,
 ):
     tickers = _prepare_universe(
-        refresh_tickers, min_market_cap_usd, refresh_market_caps, min_avg_volume,
+        refresh_tickers, min_market_cap_usd, refresh_market_caps, min_daily_volume,
     )
     results: dict[str, pd.DataFrame] = {}
     if mode in ("all", "uptrend"):
@@ -1448,8 +1521,8 @@ def main():
         help="Force-refresh market caps from Yahoo, ignoring the 7-day cache.",
     )
     parser.add_argument(
-        "--min-avg-volume", type=float, default=DEFAULT_MIN_AVG_VOLUME, metavar="SHARES",
-        help=f"Restrict to tickers with 3-month avg daily volume >= this many shares (default {DEFAULT_MIN_AVG_VOLUME:,}; pass 0 to disable).",
+        "--min-daily-volume", type=float, default=DEFAULT_MIN_DAILY_VOLUME, metavar="SHARES",
+        help=f"Restrict to tickers whose MIN daily volume in the last {MIN_VOLUME_LOOKBACK_DAYS} trading days >= this many shares (default {DEFAULT_MIN_DAILY_VOLUME:,}; pass 0 to disable). Stricter than averages — filters out stocks with quiet days.",
     )
     parser.add_argument(
         "--mode",
@@ -1520,7 +1593,7 @@ def main():
         refresh_tickers=args.refresh_tickers,
         min_market_cap_usd=args.min_market_cap,
         refresh_market_caps=args.refresh_market_caps,
-        min_avg_volume=(args.min_avg_volume if args.min_avg_volume > 0 else None),
+        min_daily_volume=(args.min_daily_volume if args.min_daily_volume > 0 else None),
         min_surprise_pct=args.min_surprise,
         min_revision_accel=args.min_revision_accel,
         min_up7d=args.min_up7d,

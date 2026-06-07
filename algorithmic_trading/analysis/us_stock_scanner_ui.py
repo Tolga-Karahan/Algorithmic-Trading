@@ -31,7 +31,7 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     DEFAULT_TARGET_LOOKBACK_DAYS,
     DEFAULT_MIN_TARGET_RAISERS,
     DEFAULT_MIN_TARGET_RAISE_PCT,
-    DEFAULT_MIN_AVG_VOLUME,
+    DEFAULT_MIN_DAILY_VOLUME,
     DEFAULT_SQUEEZE_BARS,
     DEFAULT_SQUEEZE_MAX_RANGE_PCT,
     DEFAULT_SQUEEZE_MAX_BODY_PCT,
@@ -120,10 +120,10 @@ def _build_layout():
                         ),
                     ),
                     _labelled(
-                        "Min 3-month avg daily volume (shares; 0 = no filter)",
+                        "Min daily volume in last 30 trading days (shares; 0 = no filter)",
                         dcc.Input(
-                            id="min-avg-volume", type="number",
-                            value=DEFAULT_MIN_AVG_VOLUME, step=10000,
+                            id="min-daily-volume", type="number",
+                            value=DEFAULT_MIN_DAILY_VOLUME, step=10000,
                             min=0, style={"width": "140px"},
                         ),
                     ),
@@ -442,7 +442,7 @@ _MODE_DESCRIPTIONS = {
     Input("run-btn", "n_clicks"),
     State("mode", "value"),
     State("market-cap", "value"),
-    State("min-avg-volume", "value"),
+    State("min-daily-volume", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
     State("min-gain", "value"),
@@ -459,7 +459,7 @@ _MODE_DESCRIPTIONS = {
     State("squeeze-direction-input", "value"),
     prevent_initial_call=True,
 )
-def _prep_scan(n_clicks, mode, market_cap_str, min_avg_volume, start_date, end_date,
+def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume, start_date, end_date,
                min_gain, min_vol_ratio,
                min_surprise, min_accel, min_up7d,
                target_lookback, min_raisers, min_raise_pct,
@@ -472,14 +472,14 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_avg_volume, start_date, end_d
         except Exception as e:
             return no_update, f"❌ Invalid market cap: {e}"
 
-    vol_filter = float(min_avg_volume) if min_avg_volume and float(min_avg_volume) > 0 else None
+    vol_filter = float(min_daily_volume) if min_daily_volume and float(min_daily_volume) > 0 else None
 
     try:
         tickers = _prepare_universe(
             refresh_tickers=False,
             min_market_cap_usd=cap_usd,
             refresh_market_caps=False,
-            min_avg_volume=vol_filter,
+            min_daily_volume=vol_filter,
         )
     except Exception as e:
         return no_update, f"❌ Failed to load universe: {e}"
@@ -612,7 +612,7 @@ def _refresh_calendars(n_clicks, days_ahead, market_cap_str):
             refresh_tickers=False,
             min_market_cap_usd=cap_usd,
             refresh_market_caps=False,
-            min_avg_volume=DEFAULT_MIN_AVG_VOLUME,
+            min_daily_volume=DEFAULT_MIN_DAILY_VOLUME,
         )
         earnings_rows = get_upcoming_earnings(tickers, days_ahead=days)
     except Exception as e:
