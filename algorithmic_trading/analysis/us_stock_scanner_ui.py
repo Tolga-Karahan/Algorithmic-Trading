@@ -44,33 +44,81 @@ def _reset_progress():
     _SCAN_PROGRESS["desc"] = ""
 
 
-def _previous_weekday(d: dt.date) -> dt.date:
-    """Most recent weekday strictly before `d` (Sat→Fri, Mon→Fri)."""
+import pandas as _pd
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar, Holiday, USMartinLutherKingJr,
+    USPresidentsDay, GoodFriday, USMemorialDay, USLaborDay,
+    USThanksgivingDay, nearest_workday,
+)
+
+
+class _NYSECalendar(AbstractHolidayCalendar):
+    """NYSE market-closure calendar (full-day closures only; no early-close handling)."""
+    rules = [
+        Holiday("New Year's Day",   month=1,  day=1,  observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday("Juneteenth",       month=6,  day=19, start_date="2022-06-20",
+                observance=nearest_workday),
+        Holiday("Independence Day", month=7,  day=4,  observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("Christmas",        month=12, day=25, observance=nearest_workday),
+    ]
+
+
+# Pre-compute a wide range once on import (cheap; a few hundred dates).
+_NYSE_HOLIDAYS: set[dt.date] = {
+    d.date() for d in _NYSECalendar().holidays(start="2020-01-01", end="2035-12-31")
+}
+
+
+def _is_trading_day(d: dt.date) -> bool:
+    """True if d is a weekday and not a NYSE-closed holiday."""
+    return d.weekday() < 5 and d not in _NYSE_HOLIDAYS
+
+
+def _previous_trading_day(d: dt.date) -> dt.date:
+    """Most recent trading day strictly before `d` (skips weekends + NYSE holidays)."""
     d = d - dt.timedelta(days=1)
-    while d.weekday() >= 5:
+    while not _is_trading_day(d):
         d -= dt.timedelta(days=1)
     return d
+
+
+def _holiday_name(d: dt.date) -> str | None:
+    """Return the NYSE holiday name for `d`, or None if it's not a holiday."""
+    if d not in _NYSE_HOLIDAYS:
+        return None
+    for h in _NYSECalendar().rules:
+        for ts in h.dates(_pd.Timestamp(d.year, 1, 1), _pd.Timestamp(d.year, 12, 31)):
+            if ts.date() == d:
+                return h.name
+    return "holiday"
 
 
 def _market_status() -> tuple[str, dt.date]:
     """Return (human-readable market status, last-trading-day date).
 
-    'Last trading day' is the most recent date that has at least one completed
-    regular-session bar:
-      - During or after today's regular session (weekday, >= 9:30 ET) → today
-      - Pre-market on a weekday → previous weekday (e.g., Tue 8am ET → Mon)
-      - Weekend → previous Friday
-
-    Holidays are not handled — only weekends.
+    'Last trading day' is the most recent date with at least one completed
+    regular-session bar. Accounts for weekends and NYSE holidays.
     """
     now_utc = dt.datetime.now(tz=dt.timezone.utc)
     # US Eastern offset (rough; ignores DST nuances — boundary correctness matters
     # more than exact minutes).
     et = now_utc - dt.timedelta(hours=4)
     today = dt.date.today()
-    session_started = et.weekday() < 5 and (et.hour > 9 or (et.hour == 9 and et.minute >= 30))
-    last = today if session_started else _previous_weekday(today)
+    session_started = (
+        _is_trading_day(today)
+        and (et.hour > 9 or (et.hour == 9 and et.minute >= 30))
+    )
+    last = today if session_started else _previous_trading_day(today)
 
+    holiday = _holiday_name(today)
+    if holiday:
+        return f"closed ({holiday})", last
     if et.weekday() >= 5:
         return f"closed ({et.strftime('%A')})", last
     minutes_since_open = (et.hour - 9) * 60 + et.minute - 30
