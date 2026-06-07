@@ -38,6 +38,7 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     DEFAULT_MIN_TARGET_RAISERS,
     DEFAULT_MIN_TARGET_RAISE_PCT,
     DEFAULT_MIN_DAILY_VOLUME,
+    DEFAULT_MIN_ETF_ASSETS,
     DEFAULT_SQUEEZE_BARS,
     DEFAULT_SQUEEZE_MAX_RANGE_PCT,
     DEFAULT_SQUEEZE_MAX_BODY_PCT,
@@ -179,6 +180,22 @@ def _build_layout():
                             id="min-daily-volume", type="number",
                             value=DEFAULT_MIN_DAILY_VOLUME, step=10000,
                             min=0, style={"width": "140px"},
+                        ),
+                    ),
+                    _labelled(
+                        "Include ETFs",
+                        dcc.Checklist(
+                            id="include-etfs",
+                            options=[{"label": " include large ETFs in universe", "value": "yes"}],
+                            value=[], inline=True,
+                            style={"display": "inline-block"},
+                        ),
+                    ),
+                    _labelled(
+                        "Min ETF net assets (e.g. 15B, ignored if ETFs not included)",
+                        dcc.Input(
+                            id="min-etf-assets", type="text",
+                            value="15B", style={"width": "120px"},
                         ),
                     ),
                     _labelled(
@@ -535,6 +552,8 @@ _MODE_DESCRIPTIONS = {
     State("mode", "value"),
     State("market-cap", "value"),
     State("min-daily-volume", "value"),
+    State("include-etfs", "value"),
+    State("min-etf-assets", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
     State("min-gain", "value"),
@@ -551,7 +570,9 @@ _MODE_DESCRIPTIONS = {
     State("squeeze-direction-input", "value"),
     prevent_initial_call=True,
 )
-def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume, start_date, end_date,
+def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
+               include_etfs_value, min_etf_assets_str,
+               start_date, end_date,
                min_gain, min_vol_ratio,
                min_surprise, min_accel, min_up7d,
                target_lookback, min_raisers, min_raise_pct,
@@ -566,12 +587,25 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume, start_date, end
 
     vol_filter = float(min_daily_volume) if min_daily_volume and float(min_daily_volume) > 0 else None
 
+    include_etfs = bool(include_etfs_value)
+    etf_assets_filter = None
+    if include_etfs:
+        if min_etf_assets_str and min_etf_assets_str.strip():
+            try:
+                etf_assets_filter = _parse_market_cap(min_etf_assets_str)
+            except Exception as e:
+                return no_update, f"❌ Invalid min ETF assets: {e}"
+        else:
+            etf_assets_filter = DEFAULT_MIN_ETF_ASSETS
+
     try:
         tickers = _prepare_universe(
             refresh_tickers=False,
             min_market_cap_usd=cap_usd,
             refresh_market_caps=False,
             min_daily_volume=vol_filter,
+            include_etfs=include_etfs,
+            min_etf_assets=etf_assets_filter,
         )
     except Exception as e:
         return no_update, f"❌ Failed to load universe: {e}"

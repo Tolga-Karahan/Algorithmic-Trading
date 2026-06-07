@@ -170,6 +170,12 @@ MIN_VOLUME_LOOKBACK_DAYS = 30          # trading days to check
 MIN_VOLUME_CACHE_FILENAME = ".us_min_volumes_cache.json"
 MIN_VOLUME_CACHE_TTL_SECONDS = 24 * 3600
 
+ETF_TICKERS_CACHE_FILENAME = ".us_etfs_cache.txt"
+ETF_ASSETS_CACHE_FILENAME = ".us_etf_assets_cache.json"
+ETF_ASSETS_CACHE_TTL_SECONDS = 7 * 24 * 3600
+ETF_LIQUIDITY_PREFILTER_VOLUME = 50_000   # skip AUM fetch for ETFs below this avg vol
+DEFAULT_MIN_ETF_ASSETS = 15_000_000_000   # $15B
+
 DEFAULT_SQUEEZE_BARS = 6                 # bars of tight consolidation required before breakout
 DEFAULT_SQUEEZE_MAX_RANGE_PCT = 4.0      # high-low spread over those bars must be <= this % of midpoint
 DEFAULT_SQUEEZE_MAX_BODY_PCT = 1.5       # no single body in the consolidation may exceed this %
@@ -478,6 +484,148 @@ def get_min_volumes(tickers: list[str], force_refresh: bool = False) -> dict[str
     return cached
 
 
+# ----- ETF universe + AUM -----
+
+def _fetch_etfs_from_nasdaq() -> list[str] | None:
+    """Pull ETF tickers from NASDAQ Trader directory files."""
+    session = _get_session()
+    etfs: set[str] = set()
+    try:
+        for url, is_nasdaq in ((NASDAQ_LISTED_URL, True), (OTHER_LISTED_URL, False)):
+            r = session.get(url, timeout=FETCH_TIMEOUT)
+            r.raise_for_status()
+            for line in r.text.splitlines()[1:]:
+                if not line or line.startswith("File Creation Time"):
+                    continue
+                parts = line.split("|")
+                if len(parts) < 7:
+                    continue
+                if is_nasdaq:
+                    sym, _name, _mkt, test, _fin, _lot, etf_flag = parts[:7]
+                else:
+                    sym, _name, _ex, _cqs, etf_flag, _lot, test = parts[:7]
+                if etf_flag == "Y" and test != "Y" and sym:
+                    etfs.add(sym)
+    except Exception as e:
+        if VERBOSE:
+            print(f"NASDAQ ETF fetch failed: {e}")
+        return None
+    return sorted(etfs)
+
+
+def _etf_tickers_cache_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ETF_TICKERS_CACHE_FILENAME)
+
+
+def get_etfs(force_refresh: bool = False) -> list[str]:
+    """Cached ETF ticker list from NASDAQ Trader (24h TTL, mirrors get_tickers)."""
+    path = _etf_tickers_cache_path()
+    if not force_refresh and os.path.exists(path) and time.time() - os.path.getmtime(path) < TICKER_CACHE_TTL_SECONDS:
+        with open(path, "r") as f:
+            raw = [line.strip() for line in f if line.strip()]
+    else:
+        fetched = _fetch_etfs_from_nasdaq() or []
+        if fetched:
+            with open(path, "w") as f:
+                f.write("\n".join(fetched) + "\n")
+        raw = fetched
+    # ETF symbols use the same normalization rules; but skip the common-stock filter
+    # since legitimate ETFs can have 4-letter L/W/U-ending tickers (TQQQ, SQQQ...).
+    seen = set()
+    out = []
+    for t in raw:
+        n = _normalize_ticker(t)
+        if n and "^" not in n and "$" not in n and "=" not in n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def fetch_etf_total_assets(ticker: str) -> float | None:
+    """Net assets (AUM) for an ETF via quoteSummary.defaultKeyStatistics.totalAssets."""
+    crumb = _get_crumb()
+    if not crumb:
+        return None
+    session = _get_session()
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = session.get(
+                QUOTE_SUMMARY_URL.format(ticker=ticker),
+                params={"modules": "defaultKeyStatistics", "crumb": crumb},
+                timeout=FETCH_TIMEOUT,
+            )
+            if r.status_code in (429, 503):
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+            ks = ((data.get("quoteSummary") or {}).get("result") or [{}])[0].get("defaultKeyStatistics") or {}
+            ta = (ks.get("totalAssets") or {}).get("raw")
+            return float(ta) if ta is not None else None
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                if VERBOSE:
+                    print(f"ETF assets fetch {ticker}: {e}")
+                return None
+            time.sleep(0.5 * (2 ** attempt))
+    return None
+
+
+def _etf_assets_cache_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ETF_ASSETS_CACHE_FILENAME)
+
+
+def _load_etf_assets_cache(max_age_seconds: int) -> dict[str, float] | None:
+    path = _etf_assets_cache_path()
+    if not os.path.exists(path):
+        return None
+    if time.time() - os.path.getmtime(path) > max_age_seconds:
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_etf_assets_cache(assets: dict[str, float]):
+    with open(_etf_assets_cache_path(), "w") as f:
+        json.dump(assets, f)
+
+
+def get_etf_assets(tickers: list[str], force_refresh: bool = False) -> dict[str, float]:
+    """Cached ETF net-assets (AUM) lookup. Fetches missing per-ticker in parallel."""
+    cached: dict[str, float] = {}
+    if not force_refresh:
+        loaded = _load_etf_assets_cache(ETF_ASSETS_CACHE_TTL_SECONDS)
+        if loaded is not None:
+            cached = loaded
+
+    missing = [t for t in tickers if t not in cached]
+    if missing:
+        if VERBOSE:
+            print(f"ETF assets: {len(cached)} cached, {len(missing)} to fetch")
+        results: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            futures = {ex.submit(fetch_etf_total_assets, t): t for t in missing}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="ETF assets"):
+                ticker = futures[fut]
+                try:
+                    val = fut.result()
+                    if val is not None:
+                        results[ticker] = val
+                except Exception as e:
+                    if VERBOSE:
+                        print(f"ETF assets {ticker}: {e}")
+        cached.update(results)
+        _save_etf_assets_cache(cached)
+    elif VERBOSE:
+        print(f"ETF assets: all {len(tickers)} served from cache")
+    return cached
+
+
 def _to_unix(d: dt.date) -> int:
     return int(dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc).timestamp())
 
@@ -606,25 +754,48 @@ def _prepare_universe(
     min_market_cap_usd: float | None,
     refresh_market_caps: bool,
     min_daily_volume: float | None = None,
+    include_etfs: bool = False,
+    min_etf_assets: float | None = None,
 ) -> list[str]:
-    """Fetch tickers, apply universe-level filters (market cap, min daily volume).
+    """Fetch tickers, apply universe-level filters.
 
-    Filter order is intentional: market cap first (cheap, from cached v7 quote),
-    then the strict per-ticker min daily volume from chart history (slower).
+    Stocks: filtered by market cap (cap from cached v7 quote).
+    ETFs (optional): filtered by AUM via quoteSummary.totalAssets.
+    Min daily volume applies to the combined universe.
     """
-    tickers = get_tickers(force_refresh=refresh_tickers)
+    stocks = get_tickers(force_refresh=refresh_tickers)
 
     if min_market_cap_usd is not None:
-        metrics = get_quote_metrics(tickers, force_refresh=refresh_market_caps)
-        before = len(tickers)
-        tickers = [
-            t for t in tickers
+        metrics = get_quote_metrics(stocks, force_refresh=refresh_market_caps)
+        before = len(stocks)
+        stocks = [
+            t for t in stocks
             if (metrics.get(t, {}).get("market_cap") or 0) >= min_market_cap_usd
         ]
         print(
-            f"Market-cap filter: kept {len(tickers)}/{before} tickers "
+            f"Market-cap filter: kept {len(stocks)}/{before} stocks "
             f"with cap >= {_format_market_cap(min_market_cap_usd)}"
         )
+
+    etfs_kept: list[str] = []
+    if include_etfs and min_etf_assets is not None:
+        all_etfs = get_etfs()
+        # Pre-filter: only fetch AUM for ETFs with meaningful trading activity.
+        # A $15B+ AUM ETF effectively always trades >50k shares/day on average.
+        etf_quote_metrics = get_quote_metrics(all_etfs, force_refresh=refresh_market_caps)
+        liquid_etfs = [
+            t for t in all_etfs
+            if (etf_quote_metrics.get(t, {}).get("avg_volume") or 0) >= ETF_LIQUIDITY_PREFILTER_VOLUME
+        ]
+        aum = get_etf_assets(liquid_etfs)
+        etfs_kept = [t for t in liquid_etfs if (aum.get(t) or 0) >= min_etf_assets]
+        print(
+            f"ETF filter: kept {len(etfs_kept)}/{len(all_etfs)} ETFs "
+            f"with assets >= {_format_market_cap(min_etf_assets)} "
+            f"(after liquidity pre-filter: {len(liquid_etfs)} fetched for AUM)"
+        )
+
+    tickers = stocks + etfs_kept
 
     if min_daily_volume is not None:
         min_vols = get_min_volumes(tickers)
@@ -1412,6 +1583,8 @@ def scan(
     min_market_cap_usd: float | None = None,
     refresh_market_caps: bool = False,
     min_daily_volume: float | None = None,
+    include_etfs: bool = False,
+    min_etf_assets: float | None = None,
     min_surprise_pct: float = DEFAULT_MIN_SURPRISE_PCT,
     min_revision_accel: float = DEFAULT_MIN_REVISION_ACCEL,
     min_up7d: int = DEFAULT_MIN_UP7D,
@@ -1427,6 +1600,7 @@ def scan(
 ):
     tickers = _prepare_universe(
         refresh_tickers, min_market_cap_usd, refresh_market_caps, min_daily_volume,
+        include_etfs=include_etfs, min_etf_assets=min_etf_assets,
     )
     results: dict[str, pd.DataFrame] = {}
     if mode in ("all", "uptrend"):
@@ -1525,6 +1699,14 @@ def main():
         help=f"Restrict to tickers whose MIN daily volume in the last {MIN_VOLUME_LOOKBACK_DAYS} trading days >= this many shares (default {DEFAULT_MIN_DAILY_VOLUME:,}; pass 0 to disable). Stricter than averages — filters out stocks with quiet days.",
     )
     parser.add_argument(
+        "--include-etfs", action="store_true",
+        help="Also include large ETFs (filtered by --min-etf-assets) in the scan universe.",
+    )
+    parser.add_argument(
+        "--min-etf-assets", type=_parse_market_cap, default=None, metavar="N[KMBT]",
+        help=f"For --include-etfs: minimum ETF net assets, e.g. 15B (defaults to ${DEFAULT_MIN_ETF_ASSETS / 1e9:g}B when --include-etfs is set).",
+    )
+    parser.add_argument(
         "--mode",
         choices=("all", "uptrend", "earnings", "revisions", "targets", "squeeze"),
         default="all",
@@ -1594,6 +1776,8 @@ def main():
         min_market_cap_usd=args.min_market_cap,
         refresh_market_caps=args.refresh_market_caps,
         min_daily_volume=(args.min_daily_volume if args.min_daily_volume > 0 else None),
+        include_etfs=args.include_etfs,
+        min_etf_assets=(args.min_etf_assets if args.min_etf_assets is not None else (DEFAULT_MIN_ETF_ASSETS if args.include_etfs else None)),
         min_surprise_pct=args.min_surprise,
         min_revision_accel=args.min_revision_accel,
         min_up7d=args.min_up7d,
