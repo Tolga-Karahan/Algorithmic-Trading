@@ -634,8 +634,22 @@ def get_etf_assets(tickers: list[str], force_refresh: bool = False) -> dict[str,
     return cached
 
 
-def _to_unix(d: dt.date) -> int:
+def _to_unix(d) -> int:
+    """date or datetime → unix UTC seconds. Date is treated as 00:00 UTC."""
+    if isinstance(d, dt.datetime):
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
     return int(dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc).timestamp())
+
+
+def _to_unix_end(d) -> int:
+    """End-of-period: date → next-day midnight (inclusive end); datetime → as-is."""
+    if isinstance(d, dt.datetime):
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
+    return int(dt.datetime.combine(d + dt.timedelta(days=1), dt.time.min, tzinfo=dt.timezone.utc).timestamp())
 
 
 def _resolve_fetch_window() -> tuple[dt.date, dt.date]:
@@ -659,7 +673,7 @@ def fetch_history(
     session = _get_session()
     params = {
         "period1": _to_unix(start),
-        "period2": _to_unix(end + dt.timedelta(days=1)),
+        "period2": _to_unix_end(end),
         "interval": fetch_interval,
     }
     for attempt in range(MAX_RETRIES):
@@ -902,7 +916,9 @@ def evaluate_earnings(
     reported_date = dt.datetime.fromtimestamp(reported_ts, tz=dt.timezone.utc).date()
 
     if SCAN_START and SCAN_END:
-        if not (SCAN_START <= reported_date <= SCAN_END):
+        start_d = SCAN_START.date() if isinstance(SCAN_START, dt.datetime) else SCAN_START
+        end_d = SCAN_END.date() if isinstance(SCAN_END, dt.datetime) else SCAN_END
+        if not (start_d <= reported_date <= end_d):
             return None
     else:
         if reported_date != _previous_trading_day():
@@ -1098,9 +1114,11 @@ def scan_squeeze(
     start, end = _resolve_fetch_window()
     # Yahoo caps intraday history at ~730 days; truncate start if needed.
     if timeframe != "1d":
-        max_start = dt.date.today() - dt.timedelta(days=720)
-        if start < max_start:
-            start = max_start
+        max_start_date = dt.date.today() - dt.timedelta(days=720)
+        # `start` may be a date or datetime; compare on the date part.
+        start_date = start.date() if isinstance(start, dt.datetime) else start
+        if start_date < max_start_date:
+            start = max_start_date
 
     matches = []
     success = 0

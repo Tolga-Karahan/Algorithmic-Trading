@@ -42,6 +42,43 @@ def _reset_progress():
     _SCAN_PROGRESS["current"] = 0
     _SCAN_PROGRESS["total"] = 0
     _SCAN_PROGRESS["desc"] = ""
+
+
+def _previous_weekday(d: dt.date) -> dt.date:
+    """Most recent weekday strictly before `d` (Sat→Fri, Mon→Fri)."""
+    d = d - dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d
+
+
+def _market_status() -> tuple[str, dt.date]:
+    """Return (human-readable market status, last-trading-day date).
+
+    'Last trading day' is the most recent date that has at least one completed
+    regular-session bar:
+      - During or after today's regular session (weekday, >= 9:30 ET) → today
+      - Pre-market on a weekday → previous weekday (e.g., Tue 8am ET → Mon)
+      - Weekend → previous Friday
+
+    Holidays are not handled — only weekends.
+    """
+    now_utc = dt.datetime.now(tz=dt.timezone.utc)
+    # US Eastern offset (rough; ignores DST nuances — boundary correctness matters
+    # more than exact minutes).
+    et = now_utc - dt.timedelta(hours=4)
+    today = dt.date.today()
+    session_started = et.weekday() < 5 and (et.hour > 9 or (et.hour == 9 and et.minute >= 30))
+    last = today if session_started else _previous_weekday(today)
+
+    if et.weekday() >= 5:
+        return f"closed ({et.strftime('%A')})", last
+    minutes_since_open = (et.hour - 9) * 60 + et.minute - 30
+    if minutes_since_open < 0:
+        return "closed (pre-market)", last
+    if et.hour >= 16:
+        return "closed (after-hours)", last
+    return "OPEN", last
 from algorithmic_trading.analysis.us_stock_scanner import (
     _parse_market_cap,
     _prepare_universe,
@@ -220,11 +257,19 @@ def _build_layout():
                     ),
                     _labelled(
                         "Date range (only used by uptrend / earnings / squeeze)",
-                        dcc.DatePickerRange(
-                            id="date-range",
-                            display_format="YYYY-MM-DD",
-                            clearable=True,
-                        ),
+                        html.Div([
+                            dcc.DatePickerRange(
+                                id="date-range",
+                                display_format="YYYY-MM-DD",
+                                clearable=True,
+                            ),
+                            html.Span("  start time (UTC) ", style={"marginLeft": "10px"}),
+                            dcc.Input(id="start-time", type="text", value="00:00",
+                                      placeholder="HH:MM", style={"width": "80px"}),
+                            html.Span("  end time (UTC) ", style={"marginLeft": "10px"}),
+                            dcc.Input(id="end-time", type="text", value="23:59",
+                                      placeholder="HH:MM", style={"width": "80px"}),
+                        ], style={"display": "inline-flex", "alignItems": "center"}),
                     ),
 
                     # --- Mode-specific parameters --------------------------------
@@ -634,6 +679,8 @@ _MODE_DESCRIPTIONS = {
     State("min-etf-assets", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
+    State("start-time", "value"),
+    State("end-time", "value"),
     State("min-gain", "value"),
     State("min-vol-ratio", "value"),
     State("min-surprise", "value"),
@@ -653,7 +700,7 @@ _MODE_DESCRIPTIONS = {
 )
 def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
                min_etf_assets_str,
-               start_date, end_date,
+               start_date, end_date, start_time, end_time,
                min_gain, min_vol_ratio,
                min_surprise, min_accel, min_up7d,
                target_lookback, min_raisers, min_raise_pct,
@@ -687,21 +734,31 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
     except Exception as e:
         return no_update, f"❌ Failed to load universe: {e}"
 
-    # Build a descriptive status that mirrors the CLI's "Scanning N tickers..." line
+    market_str, last_td = _market_status()
+    # If no range was provided and this is a date-aware scan, default to today.
+    effective_start = start_date
+    effective_end = end_date
+    if mode in ("uptrend", "earnings", "squeeze") and not start_date and not end_date:
+        iso = last_td.isoformat()
+        effective_start = iso
+        effective_end = iso
+
     if mode in ("uptrend", "earnings", "squeeze"):
-        if start_date and end_date:
-            window = f"using window {start_date} → {end_date}"
-        else:
-            window = "(previous trading day)"
-        status = f"⏳ Scanning {len(tickers)} tickers {window} for {_MODE_DESCRIPTIONS[mode]}..."
+        window = f"using window {effective_start} → {effective_end}"
+        status = (
+            f"⏳ Market: {market_str}. Scanning {len(tickers)} tickers "
+            f"{window} for {_MODE_DESCRIPTIONS[mode]}..."
+        )
     else:
         status = f"⏳ Scanning {len(tickers)} tickers for {_MODE_DESCRIPTIONS[mode]}..."
 
     payload = {
         "mode": mode,
         "tickers": tickers,
-        "start_date": start_date,
-        "end_date": end_date,
+        "start_date": effective_start,
+        "end_date": effective_end,
+        "start_time": start_time or "00:00",
+        "end_time": end_time or "23:59",
         "min_gain": min_gain,
         "min_vol_ratio": min_vol_ratio,
         "min_surprise": min_surprise,
@@ -736,8 +793,24 @@ def _execute_scan(trigger):
     mode = trigger["mode"]
     tickers = trigger["tickers"]
 
-    scanner.SCAN_START = dt.date.fromisoformat(trigger["start_date"]) if trigger["start_date"] else None
-    scanner.SCAN_END = dt.date.fromisoformat(trigger["end_date"]) if trigger["end_date"] else None
+    def _combine(d_str, t_str, default_time):
+        if not d_str:
+            return None
+        d = dt.date.fromisoformat(d_str)
+        try:
+            t = dt.time.fromisoformat(t_str) if t_str else default_time
+        except ValueError:
+            t = default_time
+        # If the user didn't change the time inputs from defaults, keep as plain date
+        # (preserves the legacy "whole day" semantics and skips the datetime path).
+        if t == dt.time(0, 0) and default_time == dt.time(0, 0):
+            return d
+        if t == dt.time(23, 59) and default_time == dt.time(23, 59):
+            return d
+        return dt.datetime.combine(d, t, tzinfo=dt.timezone.utc)
+
+    scanner.SCAN_START = _combine(trigger["start_date"], trigger.get("start_time"), dt.time(0, 0))
+    scanner.SCAN_END = _combine(trigger["end_date"], trigger.get("end_time"), dt.time(23, 59))
     if mode == "uptrend":
         scanner.MIN_DAILY_GAIN_PCT = float(trigger["min_gain"])
         scanner.MIN_VOL_RATIO = float(trigger["min_vol_ratio"])
