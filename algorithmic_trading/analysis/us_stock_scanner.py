@@ -1520,14 +1520,30 @@ def compute_economic_releases(days_ahead: int = 30) -> list[dict]:
     # Walk months overlapping the window
     year, month = today.year, today.month
     while dt.date(year, month, 1) <= end:
+        # ADP Employment: typically the Wednesday two days before NFP (= same week as 1st Friday)
+        first_fri = _nth_weekday(year, month, 4, 1)
+        adp = first_fri - dt.timedelta(days=2)
+        if adp.month != month:  # NFP on the 1st-2nd → push ADP to first Wed of month
+            adp = _nth_weekday(year, month, 2, 1)
+
         monthly = {
-            "Non-Farm Payrolls":      _nth_weekday(year, month, 4, 1),  # 1st Fri
-            "ISM Manufacturing PMI":  _nth_business_day(year, month, 1),
-            "ISM Services PMI":       _nth_business_day(year, month, 3),
-            "CPI Report":             _nth_weekday(year, month, 2, 2),  # 2nd Wed
-            "PPI Report":             _nth_weekday(year, month, 3, 2),  # 2nd Thu
-            "Retail Sales":           _nth_weekday(year, month, 1, 3),  # 3rd Tue
-            "PCE Deflator":           _last_weekday(year, month, 4),    # last Fri
+            "ADP Employment Report":       adp,
+            "Non-Farm Payrolls":           first_fri,
+            "ISM Manufacturing PMI":       _nth_business_day(year, month, 1),
+            "ISM Services PMI":            _nth_business_day(year, month, 3),
+            "CPI Report":                  _nth_weekday(year, month, 2, 2),  # 2nd Wed
+            "PPI Report":                  _nth_weekday(year, month, 3, 2),  # 2nd Thu
+            "OPEC Monthly Oil Report":     _nth_weekday(year, month, 2, 2),  # 2nd Wed (12-15th)
+            "Michigan Sentiment (Prelim)": _nth_weekday(year, month, 4, 2),  # 2nd Fri
+            "Retail Sales":                _nth_weekday(year, month, 1, 3),  # 3rd Tue
+            "Housing Starts":              _nth_weekday(year, month, 1, 3),  # 3rd Tue
+            "Industrial Production":       _nth_weekday(year, month, 1, 3),  # 3rd Tue
+            "Existing Home Sales":         _nth_weekday(year, month, 3, 3),  # 3rd Thu (~20-22nd)
+            "New Home Sales":              _nth_weekday(year, month, 1, 4),  # 4th Tue (~23-27th)
+            "Durable Goods Orders":        _nth_weekday(year, month, 2, 4),  # 4th Wed
+            "Consumer Confidence":         _last_weekday(year, month, 1),    # last Tue
+            "Michigan Sentiment (Final)":  _last_weekday(year, month, 4),    # last Fri
+            "PCE Deflator":                _last_weekday(year, month, 4),    # last Fri
         }
         for name, date in monthly.items():
             if today <= date <= end:

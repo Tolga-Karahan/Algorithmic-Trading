@@ -35,6 +35,13 @@ class _ProgressTqdm(_real_tqdm):
 # Replace the scanner module's tqdm reference so its internal `tqdm(...)`
 # calls feed our progress dict instead of the vanilla bar.
 scanner.tqdm = _ProgressTqdm
+
+
+def _reset_progress():
+    """Mark progress complete so the UI poller hides the bar."""
+    _SCAN_PROGRESS["current"] = 0
+    _SCAN_PROGRESS["total"] = 0
+    _SCAN_PROGRESS["desc"] = ""
 from algorithmic_trading.analysis.us_stock_scanner import (
     _parse_market_cap,
     _prepare_universe,
@@ -582,6 +589,8 @@ def _startup_warmup(_):
     except Exception:
         # Hide overlay anyway so user can interact; errors will surface on Run.
         pass
+    finally:
+        _reset_progress()
     return {"display": "none"}, "done"
 
 
@@ -759,6 +768,10 @@ def _execute_scan(trigger):
             return [], [], f"Unknown mode: {mode}"
     except Exception:
         return no_update, no_update, f"❌ Scan failed:\n{traceback.format_exc()}"
+    finally:
+        # Always clear progress on completion — tqdm sometimes leaves the
+        # counter at N-1 if the last update doesn't fire cleanly.
+        _reset_progress()
 
     if df is None or df.empty:
         return [], [], f"{mode} scan: no matches (universe size: {len(tickers)})"
@@ -808,6 +821,8 @@ def _refresh_calendars(n_clicks, days_ahead, market_cap_str):
         earnings_rows = get_upcoming_earnings(tickers, days_ahead=days)
     except Exception as e:
         return econ_records, econ_columns, [], [], f"❌ Earnings calendar failed: {e}"
+    finally:
+        _reset_progress()
 
     earnings_records = [
         {
