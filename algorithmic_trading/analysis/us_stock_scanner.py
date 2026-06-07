@@ -182,6 +182,8 @@ DEFAULT_SQUEEZE_BREAKOUT_PCT = 1.5       # today's close must clear the consol r
 DEFAULT_SQUEEZE_DIRECTION = "both"       # 'up', 'down', or 'both'
 DEFAULT_SQUEEZE_TIMEFRAME = "1d"         # '1d' (default), '4h', '1h'
 SQUEEZE_TIMEFRAMES = ("1d", "4h", "1h")
+DEFAULT_SQUEEZE_MAX_LOOKBACK = 5         # try breakout at position -1, -2, ..., up to this many bars back
+DEFAULT_SQUEEZE_MIN_BARS = 3             # shortest consolidation we'll accept (per candidate breakout)
 
 DEFAULT_MIN_SURPRISE_PCT = 10.0
 DEFAULT_MIN_REVISION_ACCEL = 2.0     # 7d pace must be >= this x 30d pace
@@ -959,35 +961,22 @@ def scan_uptrend(tickers: list[str]):
     return out
 
 
-def evaluate_squeeze(
+def _check_squeeze_at(
     ticker: str,
     df,
+    breakout_pos: int,
     consol_bars: int,
     max_range_pct: float,
     breakout_pct: float,
     direction: str,
+    bars_ago: int,
 ):
-    """Detect a tight consolidation followed by a breakout on the LAST bar.
-
-    Consolidation: prior `consol_bars` bars satisfy
-      (max High - min Low) / midpoint <= max_range_pct
-
-    Breakout (today, the last bar):
-      - close clears the consol range by >= breakout_pct (above high for 'up',
-        below low for 'down')
-      - today's volume is greater than the previous bar's volume
-      - bullish bar for 'up' breakout, bearish bar for 'down' breakout
-    """
-    if df is None or df.empty:
-        return None
-    needed = consol_bars + 1  # consol_bars of history + 1 breakout bar (today)
-    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-    if len(df) < needed:
-        return None
-
-    today = df.iloc[-1]
-    prev = df.iloc[-2]
-    consol = df.iloc[-(consol_bars + 1):-1]
+    """Run the squeeze gates with `breakout_pos` (negative iloc) as the breakout bar."""
+    today = df.iloc[breakout_pos]
+    prev = df.iloc[breakout_pos - 1]
+    # consol bars are the `consol_bars` bars immediately before the breakout
+    consol_start = breakout_pos - consol_bars
+    consol = df.iloc[consol_start:breakout_pos]
 
     consol_high = float(consol["High"].max())
     consol_low = float(consol["Low"].min())
@@ -1021,7 +1010,8 @@ def evaluate_squeeze(
 
     return {
         "Ticker": ticker,
-        "Date": df.index[-1].date(),
+        "Date": df.index[breakout_pos].date() if hasattr(df.index[breakout_pos], "date") else df.index[breakout_pos],
+        "Bars Ago": bars_ago,
         "Direction": direction_str,
         "Consol Range %": round(consol_range_pct, 2),
         "Consol Low": round(consol_low, 2),
@@ -1032,6 +1022,54 @@ def evaluate_squeeze(
     }
 
 
+def evaluate_squeeze(
+    ticker: str,
+    df,
+    consol_bars: int,
+    max_range_pct: float,
+    breakout_pct: float,
+    direction: str,
+    max_lookback: int = DEFAULT_SQUEEZE_MAX_LOOKBACK,
+    min_consol_bars: int = DEFAULT_SQUEEZE_MIN_BARS,
+):
+    """Detect a tight consolidation followed by a breakout in the last few bars.
+
+    Two-dimensional sliding search:
+      - Candidate breakout position slides back from -1 to -(1 + max_lookback).
+      - For each candidate, consolidation length tries the LONGEST tight stretch
+        immediately before it (from `consol_bars` down to `min_consol_bars`).
+        Bigger consolidations win — if a disruptive big bar sits just before the
+        consolidation, the shorter window still passes.
+
+    Returns the first hit (most recent breakout, longest valid consolidation).
+    Match criteria per attempt (B = breakout bar, L = consolidation length):
+      - (max High - min Low) over L bars / midpoint <= max_range_pct
+      - B closes outside that range by >= breakout_pct
+      - B's volume > bar immediately before B's volume
+      - bullish bar for 'up', bearish bar for 'down'
+    """
+    if df is None or df.empty:
+        return None
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    min_consol_bars = max(2, min_consol_bars)
+
+    for bars_ago in range(max_lookback + 1):
+        breakout_pos = -1 - bars_ago
+        # Try the longest consolidation first; shrink if it fails.
+        for consol_len in range(consol_bars, min_consol_bars - 1, -1):
+            if len(df) < consol_len + bars_ago + 2:
+                continue
+            hit = _check_squeeze_at(
+                ticker, df, breakout_pos,
+                consol_len, max_range_pct, breakout_pct, direction,
+                bars_ago,
+            )
+            if hit:
+                hit["Consol Bars"] = consol_len
+                return hit
+    return None
+
+
 def scan_squeeze(
     tickers: list[str],
     consol_bars: int,
@@ -1039,11 +1077,14 @@ def scan_squeeze(
     breakout_pct: float,
     direction: str,
     timeframe: str = DEFAULT_SQUEEZE_TIMEFRAME,
+    max_lookback: int = DEFAULT_SQUEEZE_MAX_LOOKBACK,
+    min_consol_bars: int = DEFAULT_SQUEEZE_MIN_BARS,
 ):
     print(
         f"Scanning {len(tickers)} tickers on {timeframe} bars for "
-        f"{consol_bars}-bar tight consolidation → {direction} breakout "
-        f"(range <= {max_range_pct}%, breakout >= {breakout_pct}%)..."
+        f"{min_consol_bars}-{consol_bars} bar tight consolidation → {direction} breakout "
+        f"(range <= {max_range_pct}%, breakout >= {breakout_pct}%, "
+        f"breakout within last {max_lookback + 1} bars)..."
     )
     if SCAN_START and SCAN_END:
         print(f"  Using data window {SCAN_START} → {SCAN_END} (evaluating last bar in window)")
@@ -1071,6 +1112,7 @@ def scan_squeeze(
                 hit = evaluate_squeeze(
                     ticker, df,
                     consol_bars, max_range_pct, breakout_pct, direction,
+                    max_lookback=max_lookback, min_consol_bars=min_consol_bars,
                 )
                 if hit:
                     matches.append(hit)
@@ -1612,6 +1654,8 @@ def scan(
     squeeze_breakout_pct: float = DEFAULT_SQUEEZE_BREAKOUT_PCT,
     squeeze_direction: str = DEFAULT_SQUEEZE_DIRECTION,
     squeeze_timeframe: str = DEFAULT_SQUEEZE_TIMEFRAME,
+    squeeze_max_lookback: int = DEFAULT_SQUEEZE_MAX_LOOKBACK,
+    squeeze_min_bars: int = DEFAULT_SQUEEZE_MIN_BARS,
 ):
     tickers = _prepare_universe(
         refresh_tickers, min_market_cap_usd, refresh_market_caps, min_daily_volume,
@@ -1626,6 +1670,7 @@ def scan(
         results["squeeze"] = scan_squeeze(
             tickers, squeeze_bars, squeeze_max_range_pct,
             squeeze_breakout_pct, squeeze_direction, squeeze_timeframe,
+            max_lookback=squeeze_max_lookback, min_consol_bars=squeeze_min_bars,
         )
     if mode in ("all", "earnings"):
         print("\n=== EARNINGS SURPRISE SCAN ===")
@@ -1769,6 +1814,14 @@ def main():
         default=DEFAULT_SQUEEZE_TIMEFRAME,
         help=f"For --mode squeeze: candle interval. '4h'/'1h' use intraday data (capped at ~720 days of history). Default: {DEFAULT_SQUEEZE_TIMEFRAME}.",
     )
+    parser.add_argument(
+        "--squeeze-max-lookback", type=int, default=DEFAULT_SQUEEZE_MAX_LOOKBACK, metavar="N",
+        help=f"For --mode squeeze: catch breakouts that fired up to N bars ago (default {DEFAULT_SQUEEZE_MAX_LOOKBACK}, 0 = strictly the last bar).",
+    )
+    parser.add_argument(
+        "--squeeze-min-bars", type=int, default=DEFAULT_SQUEEZE_MIN_BARS, metavar="N",
+        help=f"For --mode squeeze: shortest acceptable consolidation length (default {DEFAULT_SQUEEZE_MIN_BARS}). The scan tries from --squeeze-bars down to this value.",
+    )
     args = parser.parse_args()
 
     VERBOSE = args.verbose
@@ -1804,6 +1857,8 @@ def main():
         squeeze_breakout_pct=args.squeeze_breakout,
         squeeze_direction=args.squeeze_direction,
         squeeze_timeframe=args.squeeze_timeframe,
+        squeeze_max_lookback=args.squeeze_max_lookback,
+        squeeze_min_bars=args.squeeze_min_bars,
     )
 
 

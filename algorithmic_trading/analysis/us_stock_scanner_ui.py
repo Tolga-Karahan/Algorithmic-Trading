@@ -13,8 +13,28 @@ import traceback
 
 import dash
 from dash import dcc, html, Input, Output, State, dash_table, no_update
+from tqdm import tqdm as _real_tqdm
 
 import algorithmic_trading.analysis.us_stock_scanner as scanner
+
+
+# Shared progress state, fed by a tqdm subclass below.
+# Single-user UI, so module-level mutable state is fine.
+_SCAN_PROGRESS = {"current": 0, "total": 0, "desc": ""}
+
+
+class _ProgressTqdm(_real_tqdm):
+    """Mirrors every tqdm update into _SCAN_PROGRESS for the UI poller."""
+    def update(self, n=1):
+        super().update(n)
+        _SCAN_PROGRESS["current"] = int(self.n)
+        _SCAN_PROGRESS["total"] = int(self.total or 0)
+        _SCAN_PROGRESS["desc"] = str(self.desc or "")
+
+
+# Replace the scanner module's tqdm reference so its internal `tqdm(...)`
+# calls feed our progress dict instead of the vanilla bar.
+scanner.tqdm = _ProgressTqdm
 from algorithmic_trading.analysis.us_stock_scanner import (
     _parse_market_cap,
     _prepare_universe,
@@ -45,6 +65,8 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     DEFAULT_SQUEEZE_DIRECTION,
     DEFAULT_SQUEEZE_TIMEFRAME,
     SQUEEZE_TIMEFRAMES,
+    DEFAULT_SQUEEZE_MAX_LOOKBACK,
+    DEFAULT_SQUEEZE_MIN_BARS,
     MIN_DAILY_GAIN_PCT,
     MIN_VOL_RATIO,
 )
@@ -247,9 +269,21 @@ def _build_layout():
                         children=[
                             html.H4("Squeeze parameters"),
                             _labelled(
-                                "Consolidation bars (before breakout)",
+                                "Max consolidation bars (before breakout)",
                                 dcc.Input(id="squeeze-bars-input", type="number",
                                           value=DEFAULT_SQUEEZE_BARS, step=1, min=2,
+                                          style={"width": "100px"}),
+                            ),
+                            _labelled(
+                                "Min consolidation bars (shortest stretch we'll accept)",
+                                dcc.Input(id="squeeze-min-bars-input", type="number",
+                                          value=DEFAULT_SQUEEZE_MIN_BARS, step=1, min=2,
+                                          style={"width": "100px"}),
+                            ),
+                            _labelled(
+                                "Max bars ago the breakout can be (0 = strictly last bar)",
+                                dcc.Input(id="squeeze-max-lookback-input", type="number",
+                                          value=DEFAULT_SQUEEZE_MAX_LOOKBACK, step=1, min=0,
                                           style={"width": "100px"}),
                             ),
                             _labelled(
@@ -327,7 +361,12 @@ def _build_layout():
             ),
 
             dcc.Store(id="scan-trigger"),
+            dcc.Interval(id="progress-poll", interval=500, disabled=False),
             html.Div(id="status", style={"margin": "16px 0", "fontWeight": "600", "color": "#475569"}),
+            html.Div(id="progress-display", style={
+                "margin": "0 0 12px 0", "fontSize": "13px", "color": "#3b82f6",
+                "fontFamily": "ui-monospace, SFMono-Regular, monospace",
+            }),
             html.Div(style=CARD_STYLE, children=[
                 dcc.Loading(
                     id="loading",
@@ -338,7 +377,11 @@ def _build_layout():
                         columns=[],
                         page_size=50,
                         sort_action="native",
-                        style_table={"overflowX": "auto", "borderRadius": "8px"},
+                        fixed_rows={"headers": True},
+                        style_table={
+                            "overflowX": "auto", "overflowY": "auto",
+                            "maxHeight": "70vh", "borderRadius": "8px",
+                        },
                         style_cell=TABLE_STYLE_CELL,
                         style_header=TABLE_STYLE_HEADER,
                         style_data_conditional=[
@@ -386,6 +429,8 @@ def _build_layout():
                 dash_table.DataTable(
                     id="econ-table", data=[], columns=[], page_size=30,
                     sort_action="native",
+                    fixed_rows={"headers": True},
+                    style_table={"overflowY": "auto", "maxHeight": "60vh"},
                     style_cell=TABLE_STYLE_CELL,
                     style_header=TABLE_STYLE_HEADER,
                     style_data_conditional=[
@@ -401,7 +446,10 @@ def _build_layout():
                     children=dash_table.DataTable(
                         id="earnings-cal-table", data=[], columns=[], page_size=50,
                         sort_action="native",
-                        style_table={"overflowX": "auto"},
+                        fixed_rows={"headers": True},
+                        style_table={
+                            "overflowX": "auto", "overflowY": "auto", "maxHeight": "70vh",
+                        },
                         style_cell=TABLE_STYLE_CELL,
                         style_header=TABLE_STYLE_HEADER,
                         style_data_conditional=[
@@ -537,6 +585,24 @@ def _startup_warmup(_):
     return {"display": "none"}, "done"
 
 
+@app.callback(
+    Output("progress-display", "children"),
+    Input("progress-poll", "n_intervals"),
+)
+def _update_progress(_):
+    p = _SCAN_PROGRESS
+    total = p.get("total") or 0
+    current = p.get("current") or 0
+    desc = p.get("desc") or ""
+    if total <= 0 or current >= total:
+        return ""
+    pct = current / total * 100
+    bar_width = 24
+    filled = int(bar_width * current / total)
+    bar = "█" * filled + "░" * (bar_width - filled)
+    return f"⏳ {desc}  {bar}  {current:,} / {total:,}  ({pct:5.1f}%)"
+
+
 _MODE_DESCRIPTIONS = {
     "uptrend":   "early-uptrend setups",
     "earnings":  "earnings surprises",
@@ -565,6 +631,8 @@ _MODE_DESCRIPTIONS = {
     State("min-raisers", "value"),
     State("min-raise-pct", "value"),
     State("squeeze-bars-input", "value"),
+    State("squeeze-min-bars-input", "value"),
+    State("squeeze-max-lookback-input", "value"),
     State("squeeze-max-range-input", "value"),
     State("squeeze-breakout-input", "value"),
     State("squeeze-direction-input", "value"),
@@ -577,8 +645,8 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
                min_gain, min_vol_ratio,
                min_surprise, min_accel, min_up7d,
                target_lookback, min_raisers, min_raise_pct,
-               squeeze_bars, squeeze_max_range,
-               squeeze_breakout, squeeze_direction, squeeze_timeframe):
+               squeeze_bars, squeeze_min_bars, squeeze_max_lookback,
+               squeeze_max_range, squeeze_breakout, squeeze_direction, squeeze_timeframe):
     """Fast: parse params, prep universe, show descriptive status, hand off to executor."""
     cap_usd = None
     if market_cap_str and market_cap_str.strip():
@@ -631,6 +699,8 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
         "min_raisers": min_raisers,
         "min_raise_pct": min_raise_pct,
         "squeeze_bars": squeeze_bars,
+        "squeeze_min_bars": squeeze_min_bars,
+        "squeeze_max_lookback": squeeze_max_lookback,
         "squeeze_max_range": squeeze_max_range,
         "squeeze_breakout": squeeze_breakout,
         "squeeze_direction": squeeze_direction,
@@ -682,6 +752,8 @@ def _execute_scan(trigger):
                 float(trigger["squeeze_breakout"]),
                 trigger["squeeze_direction"],
                 trigger["squeeze_timeframe"],
+                max_lookback=int(trigger["squeeze_max_lookback"]),
+                min_consol_bars=int(trigger["squeeze_min_bars"]),
             )
         else:
             return [], [], f"Unknown mode: {mode}"
