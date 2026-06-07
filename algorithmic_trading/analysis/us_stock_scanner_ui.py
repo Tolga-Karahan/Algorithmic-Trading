@@ -22,6 +22,7 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     scan_earnings,
     scan_revisions,
     scan_target_hikes,
+    scan_squeeze,
     compute_economic_releases,
     get_upcoming_earnings,
     DEFAULT_MIN_SURPRISE_PCT,
@@ -31,6 +32,12 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     DEFAULT_MIN_TARGET_RAISERS,
     DEFAULT_MIN_TARGET_RAISE_PCT,
     DEFAULT_MIN_AVG_VOLUME,
+    DEFAULT_SQUEEZE_BARS,
+    DEFAULT_SQUEEZE_MAX_RANGE_PCT,
+    DEFAULT_SQUEEZE_MAX_BODY_PCT,
+    DEFAULT_SQUEEZE_BREAKOUT_PCT,
+    DEFAULT_SQUEEZE_RANGE_MULT,
+    DEFAULT_SQUEEZE_DIRECTION,
     MIN_DAILY_GAIN_PCT,
     MIN_VOL_RATIO,
 )
@@ -98,6 +105,7 @@ def _build_layout():
                                 {"label": "Earnings (surprise beat)", "value": "earnings"},
                                 {"label": "Revisions (upward EPS revision acceleration)", "value": "revisions"},
                                 {"label": "Targets (price-target hikes)", "value": "targets"},
+                                {"label": "Squeeze (tight consolidation → breakout)", "value": "squeeze"},
                             ],
                             value="uptrend",
                             clearable=False,
@@ -169,6 +177,44 @@ def _build_layout():
                                 "Min upward revisions in last 7d",
                                 dcc.Input(id="min-up7d", type="number",
                                           value=DEFAULT_MIN_UP7D, step=1, style={"width": "100px"}),
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        id="squeeze-params",
+                        children=[
+                            html.H4("Squeeze parameters"),
+                            _labelled(
+                                "Consolidation bars (before breakout)",
+                                dcc.Input(id="squeeze-bars-input", type="number",
+                                          value=DEFAULT_SQUEEZE_BARS, step=1, min=2,
+                                          style={"width": "100px"}),
+                            ),
+                            _labelled(
+                                "Max consolidation range %",
+                                dcc.Input(id="squeeze-max-range-input", type="number",
+                                          value=DEFAULT_SQUEEZE_MAX_RANGE_PCT, step=0.5,
+                                          style={"width": "100px"}),
+                            ),
+                            _labelled(
+                                "Min breakout %",
+                                dcc.Input(id="squeeze-breakout-input", type="number",
+                                          value=DEFAULT_SQUEEZE_BREAKOUT_PCT, step=0.5,
+                                          style={"width": "100px"}),
+                            ),
+                            _labelled(
+                                "Direction",
+                                dcc.Dropdown(
+                                    id="squeeze-direction-input",
+                                    options=[
+                                        {"label": "Both", "value": "both"},
+                                        {"label": "Up (breakout above)", "value": "up"},
+                                        {"label": "Down (breakdown below)", "value": "down"},
+                                    ],
+                                    value=DEFAULT_SQUEEZE_DIRECTION,
+                                    clearable=False,
+                                    style={"width": "240px"},
+                                ),
                             ),
                         ],
                     ),
@@ -368,6 +414,7 @@ app.layout = _build_layout()
     Output("earnings-params", "style"),
     Output("revisions-params", "style"),
     Output("targets-params", "style"),
+    Output("squeeze-params", "style"),
     Input("mode", "value"),
 )
 def _toggle_param_panels(mode):
@@ -376,6 +423,7 @@ def _toggle_param_panels(mode):
         VISIBLE if mode == "earnings" else HIDDEN,
         VISIBLE if mode == "revisions" else HIDDEN,
         VISIBLE if mode == "targets" else HIDDEN,
+        VISIBLE if mode == "squeeze" else HIDDEN,
     )
 
 
@@ -384,6 +432,7 @@ _MODE_DESCRIPTIONS = {
     "earnings":  "earnings surprises",
     "revisions": "upward revision acceleration",
     "targets":   "price-target hikes",
+    "squeeze":   "tight-consolidation breakouts",
 }
 
 
@@ -404,12 +453,17 @@ _MODE_DESCRIPTIONS = {
     State("target-lookback", "value"),
     State("min-raisers", "value"),
     State("min-raise-pct", "value"),
+    State("squeeze-bars-input", "value"),
+    State("squeeze-max-range-input", "value"),
+    State("squeeze-breakout-input", "value"),
+    State("squeeze-direction-input", "value"),
     prevent_initial_call=True,
 )
 def _prep_scan(n_clicks, mode, market_cap_str, min_avg_volume, start_date, end_date,
                min_gain, min_vol_ratio,
                min_surprise, min_accel, min_up7d,
-               target_lookback, min_raisers, min_raise_pct):
+               target_lookback, min_raisers, min_raise_pct,
+               squeeze_bars, squeeze_max_range, squeeze_breakout, squeeze_direction):
     """Fast: parse params, prep universe, show descriptive status, hand off to executor."""
     cap_usd = None
     if market_cap_str and market_cap_str.strip():
@@ -431,7 +485,7 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_avg_volume, start_date, end_d
         return no_update, f"❌ Failed to load universe: {e}"
 
     # Build a descriptive status that mirrors the CLI's "Scanning N tickers..." line
-    if mode in ("uptrend", "earnings"):
+    if mode in ("uptrend", "earnings", "squeeze"):
         if start_date and end_date:
             window = f"using window {start_date} → {end_date}"
         else:
@@ -453,6 +507,10 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_avg_volume, start_date, end_d
         "target_lookback": target_lookback,
         "min_raisers": min_raisers,
         "min_raise_pct": min_raise_pct,
+        "squeeze_bars": squeeze_bars,
+        "squeeze_max_range": squeeze_max_range,
+        "squeeze_breakout": squeeze_breakout,
+        "squeeze_direction": squeeze_direction,
     }
     return payload, status
 
@@ -491,6 +549,20 @@ def _execute_scan(trigger):
                 int(trigger["target_lookback"]),
                 int(trigger["min_raisers"]),
                 float(trigger["min_raise_pct"]),
+            )
+        elif mode == "squeeze":
+            from algorithmic_trading.analysis.us_stock_scanner import (
+                DEFAULT_SQUEEZE_MAX_BODY_PCT as _BODY,
+                DEFAULT_SQUEEZE_RANGE_MULT as _MULT,
+            )
+            df = scan_squeeze(
+                tickers,
+                int(trigger["squeeze_bars"]),
+                float(trigger["squeeze_max_range"]),
+                _BODY,
+                float(trigger["squeeze_breakout"]),
+                _MULT,
+                trigger["squeeze_direction"],
             )
         else:
             return [], [], f"Unknown mode: {mode}"

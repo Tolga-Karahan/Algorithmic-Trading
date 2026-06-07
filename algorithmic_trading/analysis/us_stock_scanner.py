@@ -166,6 +166,13 @@ MARKETCAP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 QUOTE_METRICS_CACHE_FILENAME = ".us_quote_metrics_cache.json"
 DEFAULT_MIN_AVG_VOLUME = 200_000
 
+DEFAULT_SQUEEZE_BARS = 6                 # bars of tight consolidation required before breakout
+DEFAULT_SQUEEZE_MAX_RANGE_PCT = 4.0      # high-low spread over those bars must be <= this % of midpoint
+DEFAULT_SQUEEZE_MAX_BODY_PCT = 1.5       # no single body in the consolidation may exceed this %
+DEFAULT_SQUEEZE_BREAKOUT_PCT = 1.5       # today's close must clear the consol range by at least this %
+DEFAULT_SQUEEZE_RANGE_MULT = 1.5         # today's bar's high-low must be >= this x avg consol range
+DEFAULT_SQUEEZE_DIRECTION = "both"       # 'up', 'down', or 'both'
+
 DEFAULT_MIN_SURPRISE_PCT = 10.0
 DEFAULT_MIN_REVISION_ACCEL = 2.0     # 7d pace must be >= this x 30d pace
 DEFAULT_MIN_UP7D = 3                  # absolute min upward revisions in last 7d (noise filter)
@@ -687,6 +694,143 @@ def scan_uptrend(tickers: list[str]):
     return out
 
 
+def evaluate_squeeze(
+    ticker: str,
+    df,
+    consol_bars: int,
+    max_range_pct: float,
+    max_body_pct: float,
+    breakout_pct: float,
+    range_mult: float,
+    direction: str,
+):
+    """Detect a tight consolidation followed by a breakout on the LAST bar.
+
+    Consolidation: prior `consol_bars` bars have:
+      - (max High - min Low) / midpoint <= max_range_pct
+      - every body |Close - Open| / Open <= max_body_pct
+
+    Breakout (today, the last bar):
+      - close clears the consol range by >= breakout_pct (above high for 'up',
+        below low for 'down')
+      - today's high-low >= range_mult x avg high-low during consolidation
+      - bullish bar for 'up' breakout, bearish bar for 'down' breakout
+    """
+    if df is None or df.empty:
+        return None
+    needed = consol_bars + 2
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    if len(df) < needed:
+        return None
+
+    today = df.iloc[-1]
+    consol = df.iloc[-(consol_bars + 1):-1]
+
+    consol_high = float(consol["High"].max())
+    consol_low = float(consol["Low"].min())
+    mid = (consol_high + consol_low) / 2
+    if mid <= 0:
+        return None
+    consol_range_pct = (consol_high - consol_low) / mid * 100
+    if consol_range_pct > max_range_pct:
+        return None
+
+    bodies_pct = (consol["Close"] - consol["Open"]).abs() / consol["Open"] * 100
+    if (bodies_pct > max_body_pct).any():
+        return None
+
+    avg_range = float((consol["High"] - consol["Low"]).mean())
+    today_range = float(today["High"] - today["Low"])
+    if avg_range <= 0 or today_range < range_mult * avg_range:
+        return None
+
+    today_close = float(today["Close"])
+    today_open = float(today["Open"])
+    up_pct = (today_close - consol_high) / consol_high * 100
+    down_pct = (consol_low - today_close) / consol_low * 100
+
+    direction_str = None
+    breakout_pct_val = 0.0
+    ref_level = None
+    if direction in ("up", "both") and up_pct >= breakout_pct and today_close > today_open:
+        direction_str = "UP"
+        breakout_pct_val = up_pct
+        ref_level = consol_high
+    elif direction in ("down", "both") and down_pct >= breakout_pct and today_close < today_open:
+        direction_str = "DOWN"
+        breakout_pct_val = down_pct
+        ref_level = consol_low
+    if direction_str is None:
+        return None
+
+    return {
+        "Ticker": ticker,
+        "Date": df.index[-1].date(),
+        "Direction": direction_str,
+        "Consol Range %": round(consol_range_pct, 2),
+        "Consol Low": round(consol_low, 2),
+        "Consol High": round(consol_high, 2),
+        "Breakout %": round(breakout_pct_val, 2),
+        "Today Range x Avg": round(today_range / avg_range, 2),
+        "Close": round(today_close, 2),
+    }
+
+
+def scan_squeeze(
+    tickers: list[str],
+    consol_bars: int,
+    max_range_pct: float,
+    max_body_pct: float,
+    breakout_pct: float,
+    range_mult: float,
+    direction: str,
+):
+    print(
+        f"Scanning {len(tickers)} tickers for {consol_bars}-bar tight consolidation "
+        f"→ {direction} breakout (range <= {max_range_pct}%, breakout >= {breakout_pct}%)..."
+    )
+    if SCAN_START and SCAN_END:
+        print(f"  Using data window {SCAN_START} → {SCAN_END} (evaluating last bar in window)")
+
+    start, end = _resolve_fetch_window()
+    matches = []
+    success = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        futures = {ex.submit(fetch_history, t, start, end): t for t in tickers}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="squeeze"):
+            ticker = futures[fut]
+            df = fut.result()
+            if df is None or df.empty:
+                failed += 1
+                continue
+            success += 1
+            try:
+                hit = evaluate_squeeze(
+                    ticker, df,
+                    consol_bars, max_range_pct, max_body_pct,
+                    breakout_pct, range_mult, direction,
+                )
+                if hit:
+                    matches.append(hit)
+            except Exception as e:
+                if VERBOSE:
+                    print(f"evaluate_squeeze {ticker}: {e}")
+
+    total = success + failed
+    pct = (success / total * 100) if total else 0.0
+    print(f"\nSqueeze fetch success: {success}/{total} ({pct:.1f}%) — {failed} failed.")
+    if not matches:
+        print("No matches.")
+        return pd.DataFrame()
+    out = pd.DataFrame(matches).sort_values(
+        by=["Breakout %", "Today Range x Avg"], ascending=False
+    ).reset_index(drop=True)
+    print(f"\n{len(out)} match(es):")
+    print(out.to_string(index=False))
+    return out
+
+
 def scan_earnings(tickers: list[str], min_surprise_pct: float):
     if SCAN_START and SCAN_END:
         print(
@@ -1201,6 +1345,12 @@ def scan(
     target_lookback_days: int = DEFAULT_TARGET_LOOKBACK_DAYS,
     min_target_raisers: int = DEFAULT_MIN_TARGET_RAISERS,
     min_target_raise_pct: float = DEFAULT_MIN_TARGET_RAISE_PCT,
+    squeeze_bars: int = DEFAULT_SQUEEZE_BARS,
+    squeeze_max_range_pct: float = DEFAULT_SQUEEZE_MAX_RANGE_PCT,
+    squeeze_max_body_pct: float = DEFAULT_SQUEEZE_MAX_BODY_PCT,
+    squeeze_breakout_pct: float = DEFAULT_SQUEEZE_BREAKOUT_PCT,
+    squeeze_range_mult: float = DEFAULT_SQUEEZE_RANGE_MULT,
+    squeeze_direction: str = DEFAULT_SQUEEZE_DIRECTION,
 ):
     tickers = _prepare_universe(
         refresh_tickers, min_market_cap_usd, refresh_market_caps, min_avg_volume,
@@ -1209,6 +1359,12 @@ def scan(
     if mode in ("all", "uptrend"):
         print("\n=== UPTREND SCAN ===")
         results["uptrend"] = scan_uptrend(tickers)
+    if mode in ("all", "squeeze"):
+        print("\n=== TIGHT-CONSOLIDATION BREAKOUT SCAN ===")
+        results["squeeze"] = scan_squeeze(
+            tickers, squeeze_bars, squeeze_max_range_pct, squeeze_max_body_pct,
+            squeeze_breakout_pct, squeeze_range_mult, squeeze_direction,
+        )
     if mode in ("all", "earnings"):
         print("\n=== EARNINGS SURPRISE SCAN ===")
         results["earnings"] = scan_earnings(tickers, min_surprise_pct)
@@ -1296,8 +1452,10 @@ def main():
         help=f"Restrict to tickers with 3-month avg daily volume >= this many shares (default {DEFAULT_MIN_AVG_VOLUME:,}; pass 0 to disable).",
     )
     parser.add_argument(
-        "--mode", choices=("all", "uptrend", "earnings", "revisions", "targets"), default="all",
-        help="Which scan(s) to run: 'all' (default), 'uptrend', 'earnings', 'revisions', or 'targets'.",
+        "--mode",
+        choices=("all", "uptrend", "earnings", "revisions", "targets", "squeeze"),
+        default="all",
+        help="Which scan(s) to run: 'all' (default), 'uptrend', 'earnings', 'revisions', 'targets', or 'squeeze'.",
     )
     parser.add_argument(
         "--min-surprise", type=float, default=DEFAULT_MIN_SURPRISE_PCT, metavar="PCT",
@@ -1322,6 +1480,23 @@ def main():
     parser.add_argument(
         "--min-target-raise", type=float, default=DEFAULT_MIN_TARGET_RAISE_PCT, metavar="PCT",
         help=f"For --mode targets: median %% hike across raises must be >= this (default {DEFAULT_MIN_TARGET_RAISE_PCT}).",
+    )
+    parser.add_argument(
+        "--squeeze-bars", type=int, default=DEFAULT_SQUEEZE_BARS, metavar="N",
+        help=f"For --mode squeeze: bars of tight consolidation required (default {DEFAULT_SQUEEZE_BARS}).",
+    )
+    parser.add_argument(
+        "--squeeze-max-range", type=float, default=DEFAULT_SQUEEZE_MAX_RANGE_PCT, metavar="PCT",
+        help=f"For --mode squeeze: max consolidation range as %% of midpoint (default {DEFAULT_SQUEEZE_MAX_RANGE_PCT}).",
+    )
+    parser.add_argument(
+        "--squeeze-breakout", type=float, default=DEFAULT_SQUEEZE_BREAKOUT_PCT, metavar="PCT",
+        help=f"For --mode squeeze: min %% the breakout bar must clear the consolidation by (default {DEFAULT_SQUEEZE_BREAKOUT_PCT}).",
+    )
+    parser.add_argument(
+        "--squeeze-direction", choices=("up", "down", "both"),
+        default=DEFAULT_SQUEEZE_DIRECTION,
+        help=f"For --mode squeeze: which breakout direction(s) to catch (default {DEFAULT_SQUEEZE_DIRECTION}).",
     )
     args = parser.parse_args()
 
@@ -1352,6 +1527,10 @@ def main():
         target_lookback_days=args.target_lookback_days,
         min_target_raisers=args.min_target_raisers,
         min_target_raise_pct=args.min_target_raise,
+        squeeze_bars=args.squeeze_bars,
+        squeeze_max_range_pct=args.squeeze_max_range,
+        squeeze_breakout_pct=args.squeeze_breakout,
+        squeeze_direction=args.squeeze_direction,
     )
 
 
