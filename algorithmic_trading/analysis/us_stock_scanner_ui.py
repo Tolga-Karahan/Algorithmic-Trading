@@ -18,6 +18,12 @@ import algorithmic_trading.analysis.us_stock_scanner as scanner
 from algorithmic_trading.analysis.us_stock_scanner import (
     _parse_market_cap,
     _prepare_universe,
+    _load_quote_metrics_cache,
+    _load_min_volume_cache,
+    _load_ticker_cache,
+    MARKETCAP_CACHE_TTL_SECONDS,
+    MIN_VOLUME_CACHE_TTL_SECONDS,
+    TICKER_CACHE_TTL_SECONDS,
     scan_uptrend,
     scan_earnings,
     scan_revisions,
@@ -80,6 +86,52 @@ def _labelled(label: str, child):
     return html.Div([html.Label(label, style=LABEL_STYLE), child], style=ROW_STYLE)
 
 
+def _build_startup_overlay():
+    return html.Div(
+        id="startup-overlay",
+        style={
+            "position": "fixed", "top": 0, "left": 0,
+            "width": "100vw", "height": "100vh",
+            "background": "rgba(248, 250, 252, 0.97)",
+            "zIndex": "9999",
+            "display": "flex", "alignItems": "center", "justifyContent": "center",
+            "backdropFilter": "blur(4px)",
+        },
+        children=[
+            dcc.Loading(
+                type="circle", color="#3b82f6",
+                children=html.Div(
+                    style={
+                        "textAlign": "center", "maxWidth": "560px", "padding": "32px",
+                        "background": "white", "borderRadius": "12px",
+                        "boxShadow": "0 10px 25px rgba(0,0,0,0.1)",
+                        "border": "1px solid #e2e8f0",
+                    },
+                    children=[
+                        html.H2("Warming up", style={
+                            "color": "#0f172a", "letterSpacing": "-0.02em", "marginTop": "16px",
+                        }),
+                        html.P(
+                            "Fetching the US ticker list, market caps, and 30-day min daily "
+                            "volumes from Yahoo Finance. The browser will stay on this screen "
+                            "while we populate the on-disk caches.",
+                            style={"color": "#475569", "lineHeight": "1.6"},
+                        ),
+                        html.P(
+                            "First startup of the day takes ~1-2 minutes. Subsequent runs within "
+                            "24 hours are instant (data cached on disk).",
+                            style={"color": "#94a3b8", "fontSize": "13px",
+                                   "marginTop": "16px", "lineHeight": "1.5"},
+                        ),
+                        # The hidden child below is what dcc.Loading watches for the spinner.
+                        html.Div(id="startup-sink", style={"display": "none"}),
+                    ],
+                ),
+            ),
+        ],
+    )
+
+
 def _build_layout():
     return html.Div(
         style={
@@ -90,6 +142,8 @@ def _build_layout():
             "color": "#0f172a",
         },
         children=[
+            _build_startup_overlay(),
+            dcc.Store(id="startup-trigger", data="init"),
             html.H1("US Stock Scanner", style={
                 "marginBottom": "24px", "color": "#0f172a", "letterSpacing": "-0.02em",
             }),
@@ -425,6 +479,44 @@ def _toggle_param_panels(mode):
         VISIBLE if mode == "targets" else HIDDEN,
         VISIBLE if mode == "squeeze" else HIDDEN,
     )
+
+
+def _missing_caches() -> list[str]:
+    """Names of caches that are missing or stale and need warming."""
+    missing = []
+    if _load_ticker_cache(TICKER_CACHE_TTL_SECONDS) is None:
+        missing.append("US ticker list (NASDAQ Trader)")
+    if _load_quote_metrics_cache(MARKETCAP_CACHE_TTL_SECONDS) is None:
+        missing.append("market caps")
+    if _load_min_volume_cache(MIN_VOLUME_CACHE_TTL_SECONDS) is None:
+        missing.append("30-day min daily volumes")
+    return missing
+
+
+@app.callback(
+    Output("startup-overlay", "style"),
+    Output("startup-sink", "children"),
+    Input("startup-trigger", "data"),
+    prevent_initial_call=False,
+)
+def _startup_warmup(_):
+    """On first page load: check cache freshness, warm anything stale, then hide overlay."""
+    missing = _missing_caches()
+    if not missing:
+        return {"display": "none"}, "done"
+
+    try:
+        default_cap = _parse_market_cap("5B")
+        _prepare_universe(
+            refresh_tickers=False,
+            min_market_cap_usd=default_cap,
+            refresh_market_caps=False,
+            min_daily_volume=200_000,
+        )
+    except Exception:
+        # Hide overlay anyway so user can interact; errors will surface on Run.
+        pass
+    return {"display": "none"}, "done"
 
 
 _MODE_DESCRIPTIONS = {
