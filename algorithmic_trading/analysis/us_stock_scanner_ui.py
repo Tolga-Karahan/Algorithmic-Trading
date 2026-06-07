@@ -384,6 +384,7 @@ def _build_layout():
                         columns=[],
                         page_size=50,
                         sort_action="native",
+                        filter_action="native",
                         fixed_rows={"headers": True},
                         style_table={
                             "overflowX": "auto", "overflowY": "auto",
@@ -436,6 +437,7 @@ def _build_layout():
                 dash_table.DataTable(
                     id="econ-table", data=[], columns=[], page_size=30,
                     sort_action="native",
+                    filter_action="native",
                     fixed_rows={"headers": True},
                     style_table={"overflowY": "auto", "maxHeight": "60vh"},
                     style_cell=TABLE_STYLE_CELL,
@@ -453,6 +455,7 @@ def _build_layout():
                     children=dash_table.DataTable(
                         id="earnings-cal-table", data=[], columns=[], page_size=50,
                         sort_action="native",
+                        filter_action="native",
                         fixed_rows={"headers": True},
                         style_table={
                             "overflowX": "auto", "overflowY": "auto", "maxHeight": "70vh",
