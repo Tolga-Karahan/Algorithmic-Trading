@@ -163,7 +163,8 @@ CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 CRUMB_BOOTSTRAP_URL = "https://finance.yahoo.com/quote/AAPL/"
 MARKETCAP_BATCH_SIZE = 100
 MARKETCAP_CACHE_TTL_SECONDS = 7 * 24 * 3600
-MARKETCAP_CACHE_FILENAME = ".us_marketcaps_cache.json"
+QUOTE_METRICS_CACHE_FILENAME = ".us_quote_metrics_cache.json"
+DEFAULT_MIN_AVG_VOLUME = 200_000
 
 DEFAULT_MIN_SURPRISE_PCT = 10.0
 DEFAULT_MIN_REVISION_ACCEL = 2.0     # 7d pace must be >= this x 30d pace
@@ -312,7 +313,8 @@ def _get_crumb() -> str | None:
     return None
 
 
-def _fetch_marketcap_batch(tickers: list[str], crumb: str) -> dict[str, float]:
+def _fetch_quote_metrics_batch(tickers: list[str], crumb: str) -> dict[str, dict]:
+    """Pull marketCap + averageDailyVolume3Month for a batch via v7 quote endpoint."""
     session = _get_session()
     r = session.get(
         QUOTE_URL,
@@ -322,38 +324,47 @@ def _fetch_marketcap_batch(tickers: list[str], crumb: str) -> dict[str, float]:
     r.raise_for_status()
     data = r.json()
     quotes = (data.get("quoteResponse") or {}).get("result", [])
-    return {q["symbol"]: float(q["marketCap"]) for q in quotes if q.get("marketCap")}
+    out: dict[str, dict] = {}
+    for q in quotes:
+        sym = q.get("symbol")
+        if not sym:
+            continue
+        out[sym] = {
+            "market_cap": float(q["marketCap"]) if q.get("marketCap") else None,
+            "avg_volume": float(q["averageDailyVolume3Month"]) if q.get("averageDailyVolume3Month") else None,
+        }
+    return out
 
 
-def fetch_market_caps(tickers: list[str]) -> dict[str, float]:
-    """Bulk-fetch market caps for `tickers`. Skips entries Yahoo doesn't return."""
+def fetch_quote_metrics(tickers: list[str]) -> dict[str, dict]:
+    """Bulk-fetch market cap + avg volume for `tickers`. Skips entries Yahoo doesn't return."""
     crumb = _get_crumb()
     if not crumb:
         if VERBOSE:
-            print("could not obtain Yahoo crumb — market caps unavailable")
+            print("could not obtain Yahoo crumb — quote metrics unavailable")
         return {}
-    caps: dict[str, float] = {}
+    out: dict[str, dict] = {}
     batches = [tickers[i:i + MARKETCAP_BATCH_SIZE] for i in range(0, len(tickers), MARKETCAP_BATCH_SIZE)]
-    for batch in tqdm(batches, desc="market caps"):
+    for batch in tqdm(batches, desc="quote metrics"):
         for attempt in range(MAX_RETRIES):
             try:
-                caps.update(_fetch_marketcap_batch(batch, crumb))
+                out.update(_fetch_quote_metrics_batch(batch, crumb))
                 break
             except Exception as e:
                 if attempt == MAX_RETRIES - 1:
                     if VERBOSE:
-                        print(f"market cap batch failed: {e}")
+                        print(f"quote metrics batch failed: {e}")
                 else:
                     time.sleep(0.5 * (2 ** attempt))
-    return caps
+    return out
 
 
-def _marketcap_cache_path() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), MARKETCAP_CACHE_FILENAME)
+def _quote_metrics_cache_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), QUOTE_METRICS_CACHE_FILENAME)
 
 
-def _load_marketcap_cache(max_age_seconds: int) -> dict[str, float] | None:
-    path = _marketcap_cache_path()
+def _load_quote_metrics_cache(max_age_seconds: int) -> dict[str, dict] | None:
+    path = _quote_metrics_cache_path()
     if not os.path.exists(path):
         return None
     if time.time() - os.path.getmtime(path) > max_age_seconds:
@@ -365,28 +376,28 @@ def _load_marketcap_cache(max_age_seconds: int) -> dict[str, float] | None:
         return None
 
 
-def _save_marketcap_cache(caps: dict[str, float]):
-    with open(_marketcap_cache_path(), "w") as f:
-        json.dump(caps, f)
+def _save_quote_metrics_cache(metrics: dict[str, dict]):
+    with open(_quote_metrics_cache_path(), "w") as f:
+        json.dump(metrics, f)
 
 
-def get_market_caps(tickers: list[str], force_refresh: bool = False) -> dict[str, float]:
-    """Resolve market caps for `tickers` (cached 7d), fetching missing ones live."""
-    cached: dict[str, float] = {}
+def get_quote_metrics(tickers: list[str], force_refresh: bool = False) -> dict[str, dict]:
+    """Resolve {market_cap, avg_volume} for `tickers` (cached 7d), fetching missing ones live."""
+    cached: dict[str, dict] = {}
     if not force_refresh:
-        loaded = _load_marketcap_cache(MARKETCAP_CACHE_TTL_SECONDS)
+        loaded = _load_quote_metrics_cache(MARKETCAP_CACHE_TTL_SECONDS)
         if loaded is not None:
             cached = loaded
 
     missing = [t for t in tickers if t not in cached]
     if missing:
         if VERBOSE:
-            print(f"market caps: {len(cached)} cached, {len(missing)} to fetch")
-        fresh = fetch_market_caps(missing)
+            print(f"quote metrics: {len(cached)} cached, {len(missing)} to fetch")
+        fresh = fetch_quote_metrics(missing)
         cached.update(fresh)
-        _save_marketcap_cache(cached)
+        _save_quote_metrics_cache(cached)
     elif VERBOSE:
-        print(f"market caps: all {len(tickers)} served from cache")
+        print(f"quote metrics: all {len(tickers)} served from cache")
     return cached
 
 
@@ -517,18 +528,34 @@ def _prepare_universe(
     refresh_tickers: bool,
     min_market_cap_usd: float | None,
     refresh_market_caps: bool,
+    min_avg_volume: float | None = None,
 ) -> list[str]:
-    """Common universe construction: fetch tickers, apply market-cap filter."""
+    """Fetch tickers and apply universe-level filters (market cap, avg volume)."""
     tickers = get_tickers(force_refresh=refresh_tickers)
+    if min_market_cap_usd is None and min_avg_volume is None:
+        return tickers
+
+    metrics = get_quote_metrics(tickers, force_refresh=refresh_market_caps)
+    before = len(tickers)
+
+    def passes(t: str) -> bool:
+        m = metrics.get(t) or {}
+        if min_market_cap_usd is not None and (m.get("market_cap") or 0) < min_market_cap_usd:
+            return False
+        if min_avg_volume is not None and (m.get("avg_volume") or 0) < min_avg_volume:
+            return False
+        return True
+
+    tickers = [t for t in tickers if passes(t)]
+    filters = []
     if min_market_cap_usd is not None:
-        caps = get_market_caps(tickers, force_refresh=refresh_market_caps)
-        before = len(tickers)
-        tickers = [t for t in tickers if caps.get(t, 0) >= min_market_cap_usd]
-        print(
-            f"Market-cap filter: kept {len(tickers)}/{before} tickers "
-            f"with cap >= {_format_market_cap(min_market_cap_usd)} "
-            f"(coverage: {len(caps)}/{before} have cap data)"
-        )
+        filters.append(f"cap >= {_format_market_cap(min_market_cap_usd)}")
+    if min_avg_volume is not None:
+        filters.append(f"avg vol >= {int(min_avg_volume):,}")
+    print(
+        f"Universe filter: kept {len(tickers)}/{before} tickers "
+        f"({', '.join(filters)}; coverage: {len(metrics)}/{before})"
+    )
     return tickers
 
 
@@ -1167,6 +1194,7 @@ def scan(
     refresh_tickers: bool = False,
     min_market_cap_usd: float | None = None,
     refresh_market_caps: bool = False,
+    min_avg_volume: float | None = None,
     min_surprise_pct: float = DEFAULT_MIN_SURPRISE_PCT,
     min_revision_accel: float = DEFAULT_MIN_REVISION_ACCEL,
     min_up7d: int = DEFAULT_MIN_UP7D,
@@ -1174,7 +1202,9 @@ def scan(
     min_target_raisers: int = DEFAULT_MIN_TARGET_RAISERS,
     min_target_raise_pct: float = DEFAULT_MIN_TARGET_RAISE_PCT,
 ):
-    tickers = _prepare_universe(refresh_tickers, min_market_cap_usd, refresh_market_caps)
+    tickers = _prepare_universe(
+        refresh_tickers, min_market_cap_usd, refresh_market_caps, min_avg_volume,
+    )
     results: dict[str, pd.DataFrame] = {}
     if mode in ("all", "uptrend"):
         print("\n=== UPTREND SCAN ===")
@@ -1262,6 +1292,10 @@ def main():
         help="Force-refresh market caps from Yahoo, ignoring the 7-day cache.",
     )
     parser.add_argument(
+        "--min-avg-volume", type=float, default=DEFAULT_MIN_AVG_VOLUME, metavar="SHARES",
+        help=f"Restrict to tickers with 3-month avg daily volume >= this many shares (default {DEFAULT_MIN_AVG_VOLUME:,}; pass 0 to disable).",
+    )
+    parser.add_argument(
         "--mode", choices=("all", "uptrend", "earnings", "revisions", "targets"), default="all",
         help="Which scan(s) to run: 'all' (default), 'uptrend', 'earnings', 'revisions', or 'targets'.",
     )
@@ -1311,6 +1345,7 @@ def main():
         refresh_tickers=args.refresh_tickers,
         min_market_cap_usd=args.min_market_cap,
         refresh_market_caps=args.refresh_market_caps,
+        min_avg_volume=(args.min_avg_volume if args.min_avg_volume > 0 else None),
         min_surprise_pct=args.min_surprise,
         min_revision_accel=args.min_revision_accel,
         min_up7d=args.min_up7d,
