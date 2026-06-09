@@ -136,7 +136,11 @@ from algorithmic_trading.analysis.us_stock_scanner import (
     MARKETCAP_CACHE_TTL_SECONDS,
     MIN_VOLUME_CACHE_TTL_SECONDS,
     TICKER_CACHE_TTL_SECONDS,
-    scan_uptrend,
+    scan_momentum,
+    DEFAULT_MOMENTUM_DIRECTION,
+    MOMENTUM_DIRECTIONS,
+    DEFAULT_MOMENTUM_TIMEFRAME,
+    MOMENTUM_TIMEFRAMES,
     scan_earnings,
     scan_revisions,
     scan_target_hikes,
@@ -270,13 +274,13 @@ def _build_layout():
                         dcc.Dropdown(
                             id="mode",
                             options=[
-                                {"label": "Uptrend (price + volume breakout)", "value": "uptrend"},
-                                {"label": "Earnings (surprise beat)", "value": "earnings"},
+                                {"label": "Momentum (price + volume burst, long/short)", "value": "momentum"},
+                                {"label": "Earnings Surprise (beat)", "value": "earnings"},
                                 {"label": "Revisions (upward EPS revision acceleration)", "value": "revisions"},
                                 {"label": "Targets (price-target hikes)", "value": "targets"},
                                 {"label": "Squeeze (tight consolidation → breakout)", "value": "squeeze"},
                             ],
-                            value="uptrend",
+                            value="momentum",
                             clearable=False,
                             style={"width": "420px"},
                         ),
@@ -304,43 +308,79 @@ def _build_layout():
                         ),
                     ),
                     _labelled(
-                        "Date range (only used by uptrend / earnings / squeeze)",
+                        "Backtest mode (enables custom date range and sliding breakout lookback)",
+                        dcc.Checklist(
+                            id="backtest-mode",
+                            options=[{"label": " enable backtest mode", "value": "on"}],
+                            value=[], inline=True,
+                            style={"display": "inline-block"},
+                        ),
+                    ),
+                    _labelled(
+                        "Date range (only honored in backtest mode)",
                         html.Div([
                             dcc.DatePickerRange(
                                 id="date-range",
                                 display_format="YYYY-MM-DD",
                                 clearable=True,
+                                disabled=True,
                             ),
                             html.Span("  start time (UTC) ", style={"marginLeft": "10px"}),
                             dcc.Input(id="start-time", type="text", value="00:00",
-                                      placeholder="HH:MM", style={"width": "80px"}),
+                                      placeholder="HH:MM", style={"width": "80px"},
+                                      disabled=True),
                             html.Span("  end time (UTC) ", style={"marginLeft": "10px"}),
                             dcc.Input(id="end-time", type="text", value="23:59",
-                                      placeholder="HH:MM", style={"width": "80px"}),
+                                      placeholder="HH:MM", style={"width": "80px"},
+                                      disabled=True),
                         ], style={"display": "inline-flex", "alignItems": "center"}),
                     ),
 
                     # --- Mode-specific parameters --------------------------------
                     html.Div(
-                        id="uptrend-params",
+                        id="momentum-params",
                         children=[
-                            html.H4("Uptrend parameters"),
+                            html.H4("Momentum parameters"),
                             _labelled(
-                                "Min daily gain %",
-                                dcc.Input(id="min-gain", type="number",
+                                "Min daily gain % (absolute, applies to up AND down)",
+                                dcc.Input(id="momentum-min-gain", type="number",
                                           value=MIN_DAILY_GAIN_PCT, step=0.5, style={"width": "100px"}),
                             ),
                             _labelled(
                                 "Min volume ratio (today vs 20d avg)",
-                                dcc.Input(id="min-vol-ratio", type="number",
+                                dcc.Input(id="momentum-min-vol-ratio", type="number",
                                           value=MIN_VOL_RATIO, step=0.1, style={"width": "100px"}),
+                            ),
+                            _labelled(
+                                "Direction",
+                                dcc.Dropdown(
+                                    id="momentum-direction-input",
+                                    options=[
+                                        {"label": "Both (long + short)", "value": "both"},
+                                        {"label": "Up only (long)", "value": "up"},
+                                        {"label": "Down only (short)", "value": "down"},
+                                    ],
+                                    value=DEFAULT_MOMENTUM_DIRECTION,
+                                    clearable=False,
+                                    style={"width": "240px"},
+                                ),
+                            ),
+                            _labelled(
+                                "Timeframe (candle interval)",
+                                dcc.Dropdown(
+                                    id="momentum-timeframe-input",
+                                    options=[{"label": tf, "value": tf} for tf in MOMENTUM_TIMEFRAMES],
+                                    value=DEFAULT_MOMENTUM_TIMEFRAME,
+                                    clearable=False,
+                                    style={"width": "140px"},
+                                ),
                             ),
                         ],
                     ),
                     html.Div(
                         id="earnings-params",
                         children=[
-                            html.H4("Earnings parameters"),
+                            html.H4("Earnings Surprise parameters"),
                             _labelled(
                                 "Min EPS surprise %",
                                 dcc.Input(id="min-surprise", type="number",
@@ -381,10 +421,10 @@ def _build_layout():
                                           style={"width": "100px"}),
                             ),
                             _labelled(
-                                "Max bars ago the breakout can be (0 = strictly last bar)",
+                                "Max bars ago the breakout can be (backtest mode only; normal mode forces 2)",
                                 dcc.Input(id="squeeze-max-lookback-input", type="number",
                                           value=DEFAULT_SQUEEZE_MAX_LOOKBACK, step=1, min=0,
-                                          style={"width": "100px"}),
+                                          style={"width": "100px"}, disabled=True),
                             ),
                             _labelled(
                                 "Max consolidation range %",
@@ -633,7 +673,19 @@ app.layout = _build_layout()
 
 
 @app.callback(
-    Output("uptrend-params", "style"),
+    Output("date-range", "disabled"),
+    Output("start-time", "disabled"),
+    Output("end-time", "disabled"),
+    Output("squeeze-max-lookback-input", "disabled"),
+    Input("backtest-mode", "value"),
+)
+def _toggle_date_inputs(backtest_value):
+    enabled = "on" in (backtest_value or [])
+    return (not enabled,) * 4
+
+
+@app.callback(
+    Output("momentum-params", "style"),
     Output("earnings-params", "style"),
     Output("revisions-params", "style"),
     Output("targets-params", "style"),
@@ -642,7 +694,7 @@ app.layout = _build_layout()
 )
 def _toggle_param_panels(mode):
     return (
-        VISIBLE if mode == "uptrend" else HIDDEN,
+        VISIBLE if mode == "momentum" else HIDDEN,
         VISIBLE if mode == "earnings" else HIDDEN,
         VISIBLE if mode == "revisions" else HIDDEN,
         VISIBLE if mode == "targets" else HIDDEN,
@@ -709,7 +761,7 @@ def _update_progress(_):
 
 
 _MODE_DESCRIPTIONS = {
-    "uptrend":   "early-uptrend setups",
+    "momentum":  "early-momentum (long/short) setups",
     "earnings":  "earnings surprises",
     "revisions": "upward revision acceleration",
     "targets":   "price-target hikes",
@@ -725,12 +777,15 @@ _MODE_DESCRIPTIONS = {
     State("market-cap", "value"),
     State("min-daily-volume", "value"),
     State("min-etf-assets", "value"),
+    State("backtest-mode", "value"),
     State("date-range", "start_date"),
     State("date-range", "end_date"),
     State("start-time", "value"),
     State("end-time", "value"),
-    State("min-gain", "value"),
-    State("min-vol-ratio", "value"),
+    State("momentum-min-gain", "value"),
+    State("momentum-min-vol-ratio", "value"),
+    State("momentum-direction-input", "value"),
+    State("momentum-timeframe-input", "value"),
     State("min-surprise", "value"),
     State("min-accel", "value"),
     State("min-up7d", "value"),
@@ -747,9 +802,9 @@ _MODE_DESCRIPTIONS = {
     prevent_initial_call=True,
 )
 def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
-               min_etf_assets_str,
+               min_etf_assets_str, backtest_value,
                start_date, end_date, start_time, end_time,
-               min_gain, min_vol_ratio,
+               momentum_min_gain, momentum_min_vol_ratio, momentum_direction, momentum_timeframe,
                min_surprise, min_accel, min_up7d,
                target_lookback, min_raisers, min_raise_pct,
                squeeze_bars, squeeze_min_bars, squeeze_max_lookback,
@@ -783,22 +838,41 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
         return no_update, f"❌ Failed to load universe: {e}"
 
     market_str, last_td = _market_status()
-    # If no range was provided and this is a date-aware scan, default to today.
-    effective_start = start_date
-    effective_end = end_date
-    if mode in ("uptrend", "earnings", "squeeze") and not start_date and not end_date:
+    backtest = "on" in (backtest_value or [])
+
+    # Determine effective window + whether to override squeeze lookback.
+    if backtest:
+        effective_start = start_date
+        effective_end = end_date
+        mode_label = "BACKTEST"
+        # In backtest mode honor everything the user set.
+        effective_max_lookback = squeeze_max_lookback
+        squeeze_window_days = None
+    else:
+        # Normal mode: lock window to last trading day, force squeeze breakout
+        # to be on one of the last 3 bars (max_lookback=2 → tries positions -1,
+        # -2, -3, i.e. breakout + up to 2 follow-through bars), fetch only ~7 days.
         iso = last_td.isoformat()
         effective_start = iso
         effective_end = iso
+        mode_label = "NORMAL"
+        effective_max_lookback = 2
+        squeeze_window_days = 7
 
-    if mode in ("uptrend", "earnings", "squeeze"):
-        window = f"using window {effective_start} → {effective_end}"
+    if mode in ("momentum", "earnings", "squeeze"):
+        if backtest:
+            if not effective_start or not effective_end:
+                window = "(no date range provided)"
+            else:
+                window = f"using window {effective_start} → {effective_end}"
+        else:
+            window = f"using the last trading day ({effective_end})"
         status = (
-            f"⏳ Market: {market_str}. Scanning {len(tickers)} tickers "
+            f"⏳ [{mode_label}] Market: {market_str}. Scanning {len(tickers)} tickers "
             f"{window} for {_MODE_DESCRIPTIONS[mode]}..."
         )
     else:
-        status = f"⏳ Scanning {len(tickers)} tickers for {_MODE_DESCRIPTIONS[mode]}..."
+        status = f"⏳ [{mode_label}] Scanning {len(tickers)} tickers for {_MODE_DESCRIPTIONS[mode]}..."
 
     payload = {
         "mode": mode,
@@ -807,8 +881,10 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
         "end_date": effective_end,
         "start_time": start_time or "00:00",
         "end_time": end_time or "23:59",
-        "min_gain": min_gain,
-        "min_vol_ratio": min_vol_ratio,
+        "momentum_min_gain": momentum_min_gain,
+        "momentum_min_vol_ratio": momentum_min_vol_ratio,
+        "momentum_direction": momentum_direction,
+        "momentum_timeframe": momentum_timeframe,
         "min_surprise": min_surprise,
         "min_accel": min_accel,
         "min_up7d": min_up7d,
@@ -817,7 +893,8 @@ def _prep_scan(n_clicks, mode, market_cap_str, min_daily_volume,
         "min_raise_pct": min_raise_pct,
         "squeeze_bars": squeeze_bars,
         "squeeze_min_bars": squeeze_min_bars,
-        "squeeze_max_lookback": squeeze_max_lookback,
+        "squeeze_max_lookback": effective_max_lookback,
+        "squeeze_window_days": squeeze_window_days,
         "squeeze_max_range": squeeze_max_range,
         "squeeze_breakout": squeeze_breakout,
         "squeeze_direction": squeeze_direction,
@@ -859,13 +936,17 @@ def _execute_scan(trigger):
 
     scanner.SCAN_START = _combine(trigger["start_date"], trigger.get("start_time"), dt.time(0, 0))
     scanner.SCAN_END = _combine(trigger["end_date"], trigger.get("end_time"), dt.time(23, 59))
-    if mode == "uptrend":
-        scanner.MIN_DAILY_GAIN_PCT = float(trigger["min_gain"])
-        scanner.MIN_VOL_RATIO = float(trigger["min_vol_ratio"])
+    if mode == "momentum":
+        scanner.MIN_DAILY_GAIN_PCT = float(trigger["momentum_min_gain"])
+        scanner.MIN_VOL_RATIO = float(trigger["momentum_min_vol_ratio"])
 
     try:
-        if mode == "uptrend":
-            df = scan_uptrend(tickers)
+        if mode == "momentum":
+            df = scan_momentum(
+                tickers,
+                trigger.get("momentum_direction", "both"),
+                trigger.get("momentum_timeframe", "1d"),
+            )
         elif mode == "earnings":
             df = scan_earnings(tickers, float(trigger["min_surprise"]))
         elif mode == "revisions":
@@ -887,6 +968,7 @@ def _execute_scan(trigger):
                 trigger["squeeze_timeframe"],
                 max_lookback=int(trigger["squeeze_max_lookback"]),
                 min_consol_bars=int(trigger["squeeze_min_bars"]),
+                fetch_window_days=trigger.get("squeeze_window_days"),
             )
         else:
             return [], [], f"Unknown mode: {mode}"

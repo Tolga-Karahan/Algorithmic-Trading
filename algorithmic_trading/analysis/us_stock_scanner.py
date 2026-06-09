@@ -1,7 +1,7 @@
 """US stock signal scanner. Runs all four scans by default, sharing the universe:
 
-uptrend
-    Catches stocks at the very beginning of a potential uptrend:
+momentum
+    Catches stocks at the very beginning of a potential momentum move (long or short):
       - Quiet base for several weeks (modest return, low drawup)
       - Wide bullish candle today (close > open, gain above threshold)
       - Volume thrust (today's vol >> recent avg vol)
@@ -26,7 +26,7 @@ NOTE: Yahoo's revision/upgrade APIs are current snapshots — --start/--end is
 ignored for `revisions` and `targets`. They always apply to the most recent window.
 
 Common filters: --start/--end date range, --min-market-cap, --refresh-tickers.
-Use --mode {uptrend|earnings|revisions|targets} to run a single scan instead of all.
+Use --mode {momentum|earnings|revisions|targets|squeeze} to run a single scan instead of all.
 
 Run:
     poetry run python -m algorithmic_trading.analysis.us_stock_scanner
@@ -736,15 +736,30 @@ def fetch_history(
     return df
 
 
-def evaluate(ticker, df):
-    """Return a result dict if `ticker` matches the early-uptrend setup, else None.
+DEFAULT_MOMENTUM_DIRECTION = "both"
+MOMENTUM_DIRECTIONS = ("up", "down", "both")
+DEFAULT_MOMENTUM_TIMEFRAME = "1d"
+MOMENTUM_TIMEFRAMES = ("1d", "4h", "1h")
 
-    Evaluates the LAST bar of `df` as the candidate day. All indicators (including
-    SMA50) are computed from the price series in-memory — no extra network calls.
+
+def evaluate_momentum(ticker, df, direction: str = "up"):
+    """Match an early-momentum setup in the requested direction.
+
+    `direction` must be 'up' or 'down' (not 'both' — caller iterates).
+    Returns a result dict on match, else None. All indicators (incl. SMA50)
+    are computed from the price series in-memory.
+
+    Gates per direction:
+      UP   — bullish wide candle + volume thrust + quiet base (not already up too much)
+             + close ABOVE SMA50
+      DOWN — bearish wide candle + volume thrust + quiet base (not already down too much)
+             + close BELOW SMA50
     """
     if df is None or df.empty or len(df) < MIN_REQUIRED_BARS:
         return None
     if not {"Open", "High", "Low", "Close", "Volume"}.issubset(df.columns):
+        return None
+    if direction not in ("up", "down"):
         return None
 
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
@@ -753,13 +768,17 @@ def evaluate(ticker, df):
 
     today = df.iloc[-1]
     prev = df.iloc[-2]
-
-    # 1) Today: wide bullish candle.
     daily_gain_pct = (today["Close"] - prev["Close"]) / prev["Close"] * 100
-    if daily_gain_pct < MIN_DAILY_GAIN_PCT or today["Close"] <= today["Open"]:
-        return None
 
-    # 2) Volume thrust.
+    # 1) Today: wide directional candle.
+    if direction == "up":
+        if daily_gain_pct < MIN_DAILY_GAIN_PCT or today["Close"] <= today["Open"]:
+            return None
+    else:  # down
+        if daily_gain_pct > -MIN_DAILY_GAIN_PCT or today["Close"] >= today["Open"]:
+            return None
+
+    # 2) Volume thrust (symmetric).
     avg_vol = df["Volume"].iloc[-(VOL_AVG_DAYS + 1):-1].mean()
     if avg_vol <= 0:
         return None
@@ -767,23 +786,30 @@ def evaluate(ticker, df):
     if vol_ratio < MIN_VOL_RATIO:
         return None
 
-    # 3) The base was quiet — we want to catch the START of a move, not chase one.
+    # 3) Quiet base — we want the START of a move, not chase one.
     base = df["Close"].iloc[-(BASE_DAYS + 1):-1]
     base_return_pct = (base.iloc[-1] - base.iloc[0]) / base.iloc[0] * 100
     base_drawup_pct = (base.max() - base.min()) / base.min() * 100
-    if base_return_pct > MAX_BASE_RETURN_PCT:
+    if direction == "up" and base_return_pct > MAX_BASE_RETURN_PCT:
+        return None
+    if direction == "down" and base_return_pct < -MAX_BASE_RETURN_PCT:
         return None
     if base_drawup_pct > MAX_BASE_DRAWUP_PCT:
         return None
 
-    # 4) Trend confirmation — close above SMA50.
+    # 4) Trend confirmation against SMA50.
     sma = df["Close"].rolling(SMA_LEN).mean().iloc[-1]
-    if pd.isna(sma) or today["Close"] <= sma:
+    if pd.isna(sma):
+        return None
+    if direction == "up" and today["Close"] <= sma:
+        return None
+    if direction == "down" and today["Close"] >= sma:
         return None
 
     return {
         "Ticker": ticker,
         "Date": df.index[-1].date(),
+        "Direction": "UP" if direction == "up" else "DOWN",
         "Close": round(float(today["Close"]), 2),
         "Gain %": round(float(daily_gain_pct), 2),
         "Vol x Avg": round(float(vol_ratio), 2),
@@ -939,22 +965,46 @@ def evaluate_earnings(
     }
 
 
-def scan_uptrend(tickers: list[str]):
+def scan_momentum(
+    tickers: list[str],
+    direction: str = DEFAULT_MOMENTUM_DIRECTION,
+    timeframe: str = DEFAULT_MOMENTUM_TIMEFRAME,
+):
+    """Scan for early-momentum setups. `direction` can be 'up', 'down', or 'both'.
+    `timeframe` can be '1d' (default), '4h', or '1h'."""
     if SCAN_START and SCAN_END:
         print(
-            f"Scanning {len(tickers)} tickers using data window "
+            f"Scanning {len(tickers)} tickers on {timeframe} bars for early-momentum ({direction}) using data window "
             f"{SCAN_START} → {SCAN_END} (evaluating last bar in window)..."
         )
     else:
-        print(f"Scanning {len(tickers)} tickers (latest bar) for early-uptrend setups...")
+        print(f"Scanning {len(tickers)} tickers on {timeframe} bars (latest bar) for early-momentum ({direction}) setups...")
 
     start, end = _resolve_fetch_window()
+    # Yahoo caps intraday history at ~730 days; truncate start if needed.
+    if timeframe != "1d":
+        max_start_date = dt.date.today() - dt.timedelta(days=720)
+        start_date = start.date() if isinstance(start, dt.datetime) else start
+        if start_date < max_start_date:
+            start = max_start_date
+
     matches = []
     success = 0
     failed = 0
+
+    def _eval(ticker, df):
+        # Try the user's preferred direction(s). UP first when 'both'.
+        if direction in ("up", "both"):
+            hit = evaluate_momentum(ticker, df, "up")
+            if hit:
+                return hit
+        if direction in ("down", "both"):
+            return evaluate_momentum(ticker, df, "down")
+        return None
+
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-        futures = {ex.submit(fetch_history, t, start, end): t for t in tickers}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="scanning"):
+        futures = {ex.submit(fetch_history, t, start, end, timeframe): t for t in tickers}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="momentum"):
             ticker = futures[fut]
             df = fut.result()
             if df is None or df.empty:
@@ -962,12 +1012,12 @@ def scan_uptrend(tickers: list[str]):
                 continue
             success += 1
             try:
-                hit = evaluate(ticker, df)
+                hit = _eval(ticker, df)
                 if hit:
                     matches.append(hit)
             except Exception as e:
                 if VERBOSE:
-                    print(f"evaluate {ticker}: {e}")
+                    print(f"evaluate_momentum {ticker}: {e}")
 
     total = success + failed
     pct = (success / total * 100) if total else 0.0
@@ -976,7 +1026,7 @@ def scan_uptrend(tickers: list[str]):
         print("No matches.")
         return pd.DataFrame()
     out = pd.DataFrame(matches).sort_values(
-        by=["Vol x Avg", "Gain %"], ascending=False
+        by=["Vol x Avg", "Gain %"], ascending=[False, False]
     ).reset_index(drop=True)
     print(f"\n{len(out)} match(es):")
     print(out.to_string(index=False))
@@ -1101,6 +1151,7 @@ def scan_squeeze(
     timeframe: str = DEFAULT_SQUEEZE_TIMEFRAME,
     max_lookback: int = DEFAULT_SQUEEZE_MAX_LOOKBACK,
     min_consol_bars: int = DEFAULT_SQUEEZE_MIN_BARS,
+    fetch_window_days: int | None = None,
 ):
     print(
         f"Scanning {len(tickers)} tickers on {timeframe} bars for "
@@ -1111,7 +1162,15 @@ def scan_squeeze(
     if SCAN_START and SCAN_END:
         print(f"  Using data window {SCAN_START} → {SCAN_END} (evaluating last bar in window)")
 
-    start, end = _resolve_fetch_window()
+    if fetch_window_days is not None:
+        # Normal-mode override: fetch only the last N calendar days, ignoring
+        # the 90-day buffer that _resolve_fetch_window adds.
+        end_d = SCAN_END if SCAN_END else dt.date.today()
+        end_d = end_d.date() if isinstance(end_d, dt.datetime) else end_d
+        start = end_d - dt.timedelta(days=fetch_window_days)
+        end = end_d
+    else:
+        start, end = _resolve_fetch_window()
     # Yahoo caps intraday history at ~730 days; truncate start if needed.
     if timeframe != "1d":
         max_start_date = dt.date.today() - dt.timedelta(days=720)
@@ -1683,6 +1742,8 @@ def scan(
     refresh_market_caps: bool = False,
     min_daily_volume: float | None = None,
     min_etf_assets: float | None = DEFAULT_MIN_ETF_ASSETS,
+    momentum_direction: str = DEFAULT_MOMENTUM_DIRECTION,
+    momentum_timeframe: str = DEFAULT_MOMENTUM_TIMEFRAME,
     min_surprise_pct: float = DEFAULT_MIN_SURPRISE_PCT,
     min_revision_accel: float = DEFAULT_MIN_REVISION_ACCEL,
     min_up7d: int = DEFAULT_MIN_UP7D,
@@ -1702,9 +1763,9 @@ def scan(
         min_etf_assets=min_etf_assets,
     )
     results: dict[str, pd.DataFrame] = {}
-    if mode in ("all", "uptrend"):
-        print("\n=== UPTREND SCAN ===")
-        results["uptrend"] = scan_uptrend(tickers)
+    if mode in ("all", "momentum"):
+        print("\n=== MOMENTUM SCAN ===")
+        results["momentum"] = scan_momentum(tickers, momentum_direction, momentum_timeframe)
     if mode in ("all", "squeeze"):
         print("\n=== TIGHT-CONSOLIDATION BREAKOUT SCAN ===")
         results["squeeze"] = scan_squeeze(
@@ -1804,9 +1865,17 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=("all", "uptrend", "earnings", "revisions", "targets", "squeeze"),
+        choices=("all", "momentum", "earnings", "revisions", "targets", "squeeze"),
         default="all",
-        help="Which scan(s) to run: 'all' (default), 'uptrend', 'earnings', 'revisions', 'targets', or 'squeeze'.",
+        help="Which scan(s) to run: 'all' (default), 'momentum', 'earnings', 'revisions', 'targets', or 'squeeze'.",
+    )
+    parser.add_argument(
+        "--momentum-direction", choices=MOMENTUM_DIRECTIONS, default=DEFAULT_MOMENTUM_DIRECTION,
+        help=f"For --mode momentum: scan direction (default '{DEFAULT_MOMENTUM_DIRECTION}'). 'up' = long setups, 'down' = short setups.",
+    )
+    parser.add_argument(
+        "--momentum-timeframe", choices=MOMENTUM_TIMEFRAMES, default=DEFAULT_MOMENTUM_TIMEFRAME,
+        help=f"For --mode momentum: candle interval. '4h'/'1h' use intraday data (capped at ~720 days). Default: {DEFAULT_MOMENTUM_TIMEFRAME}.",
     )
     parser.add_argument(
         "--min-surprise", type=float, default=DEFAULT_MIN_SURPRISE_PCT, metavar="PCT",
@@ -1886,6 +1955,8 @@ def main():
         refresh_market_caps=args.refresh_market_caps,
         min_daily_volume=(args.min_daily_volume if args.min_daily_volume > 0 else None),
         min_etf_assets=(args.min_etf_assets if args.min_etf_assets is not None else DEFAULT_MIN_ETF_ASSETS),
+        momentum_direction=args.momentum_direction,
+        momentum_timeframe=args.momentum_timeframe,
         min_surprise_pct=args.min_surprise,
         min_revision_accel=args.min_revision_accel,
         min_up7d=args.min_up7d,
